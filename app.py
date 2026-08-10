@@ -142,6 +142,27 @@ def fallback_market_details(ticker: str) -> tuple[str, str]:
     return COMMON_MARKETS.get(ticker, ("Market", "MARKET"))
 
 
+def build_close_figure(stock_data: pd.DataFrame):
+    """Create the closing-value chart without persistent point markers."""
+    figure = px.line(
+        stock_data,
+        x=stock_data.index,
+        y="Close",
+        markers=False,
+        labels={"Date": "Date", "Close": "Closing value (USD)"},
+    )
+    figure.update_traces(
+        line={"color": "#22c55e", "width": 2.5},
+        hovertemplate=(
+            "Date: %{x|%Y-%m-%d}<br>"
+            "Close: %{y:,.2f} USD"
+            "<extra></extra>"
+        ),
+    )
+    figure.update_layout(hovermode="closest", showlegend=False)
+    return figure
+
+
 def main() -> None:
     """Display the Streamlit dashboard."""
     st.set_page_config(page_title="Stock Dashboard", page_icon="📈", layout="wide")
@@ -156,7 +177,7 @@ def main() -> None:
 
         p.market-identity {
             color: #8b919d;
-            font-size: 0.78rem !important;
+            font-size: 1rem !important;
             letter-spacing: 0.02em;
             margin-top: -0.75rem;
             margin-bottom: 1.5rem;
@@ -238,24 +259,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.header("Closing-value trend")
-    figure = px.line(
-        stock_data,
-        x=stock_data.index,
-        y="Close",
-        markers=True,
-        labels={"Date": "Date", "Close": "Closing value"},
-    )
-    figure.update_traces(
-        line={"color": "#22c55e", "width": 2.5},
-        marker={"color": "#22c55e", "size": 5, "symbol": "circle"},
-        hovertemplate=(
-            "Date: %{x|%Y-%m-%d}<br>"
-            "Close: %{y:,.2f}"
-            "<extra></extra>"
-        ),
-    )
-    figure.update_layout(hovermode="closest", showlegend=False)
+    figure = build_close_figure(stock_data)
     st.plotly_chart(
         figure,
         use_container_width=True,
