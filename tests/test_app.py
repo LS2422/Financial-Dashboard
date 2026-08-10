@@ -43,6 +43,29 @@ class WatchlistStorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.add_ticker_to_watchlist("../../etc/passwd", database_path)
 
+    def test_watchlist_removes_only_the_selected_valid_ticker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "watchlist.db"
+            app.add_ticker_to_watchlist("AAPL", database_path)
+            app.add_ticker_to_watchlist("MSFT", database_path)
+
+            self.assertTrue(
+                app.remove_ticker_from_watchlist("aapl", database_path)
+            )
+            self.assertFalse(
+                app.remove_ticker_from_watchlist("AAPL", database_path)
+            )
+            self.assertEqual(app.load_watchlist(database_path), ["MSFT"])
+
+    def test_watchlist_removal_rejects_invalid_ticker_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "watchlist.db"
+
+            with self.assertRaises(ValueError):
+                app.remove_ticker_from_watchlist(
+                    "../../etc/passwd", database_path
+                )
+
 
 class WatchlistPriceTests(unittest.TestCase):
     def test_latest_close_and_one_day_percentage_change(self) -> None:
@@ -120,6 +143,85 @@ class WatchlistNavigationTests(unittest.TestCase):
             app.selected_ticker_from_query({"ticker": "../../etc/passwd"}),
             "",
         )
+
+
+class MarketSummaryTests(unittest.TestCase):
+    def test_stock_download_uses_fixed_trailing_year(self) -> None:
+        market_data = pd.DataFrame(
+            {"Close": [100.0]},
+            index=pd.to_datetime(["2026-08-07"]),
+        )
+
+        with patch.object(
+            app.yf, "download", return_value=market_data
+        ) as download:
+            returned_data = app.download_stock_data("AAPL")
+
+        self.assertIs(returned_data, market_data)
+        self.assertEqual(download.call_args.kwargs["period"], "1y")
+        self.assertNotIn("start", download.call_args.kwargs)
+        self.assertNotIn("end", download.call_args.kwargs)
+
+    def test_latest_market_summary_uses_newest_available_row_and_close(self) -> None:
+        market_data = pd.DataFrame(
+            {
+                "Open": [100.0, 105.0, 108.0],
+                "High": [106.0, 109.0, 112.0],
+                "Low": [99.0, 104.0, 107.0],
+                "Close": [104.0, None, 110.0],
+            },
+            index=pd.to_datetime(
+                ["2026-08-06", "2026-08-07", "2026-08-10"]
+            ),
+        )
+
+        summary = app.latest_market_summary(market_data)
+
+        self.assertEqual(summary["date"], pd.Timestamp("2026-08-10"))
+        self.assertEqual(summary["open"], 108.0)
+        self.assertEqual(summary["high"], 112.0)
+        self.assertEqual(summary["low"], 107.0)
+        self.assertAlmostEqual(summary["return"], (110.0 / 104.0 - 1) * 100)
+
+    def test_fundamental_metrics_include_only_available_values(self) -> None:
+        metrics = app.format_fundamental_metrics(
+            {
+                "trailingPE": 31.234,
+                "dividendRate": 1.04,
+                "dividendYield": 0.42,
+                "lastDividendValue": 0.26,
+                "trailingEps": 7.18,
+                "exDividendDate": 1786665600,
+                "marketCap": 3_420_000_000_000,
+                "sharesOutstanding": 15_200_000_000,
+                "unused": None,
+            }
+        )
+
+        self.assertEqual(
+            metrics,
+            [
+                ("P/E Ratio", "31.23"),
+                ("Dividend", "$1.04 · 0.42%"),
+                ("Quarterly Dividend", "$0.26"),
+                ("EPS", "$7.18"),
+                ("Ex-Dividend Date", "2026-08-14"),
+                ("Market Cap", "$3.42T"),
+                ("Shares Outstanding", "15.20B"),
+            ],
+        )
+
+    def test_fundamental_metrics_omit_missing_and_invalid_values(self) -> None:
+        metrics = app.format_fundamental_metrics(
+            {
+                "trailingPE": None,
+                "dividendYield": float("nan"),
+                "exDividendDate": "not-a-date",
+                "marketCap": 2_500_000,
+            }
+        )
+
+        self.assertEqual(metrics, [("Market Cap", "$2.50M")])
 
 
 if __name__ == "__main__":

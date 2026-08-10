@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 from collections.abc import Mapping
-from datetime import date, timedelta
 from html import escape
 from pathlib import Path
 from urllib.parse import urlencode
@@ -119,6 +119,20 @@ def add_ticker_to_watchlist(
     return cursor.rowcount == 1
 
 
+def remove_ticker_from_watchlist(
+    ticker: str, database_path: Path = WATCHLIST_DB_PATH
+) -> bool:
+    """Remove one validated ticker and return whether a row was deleted."""
+    cleaned_ticker = validate_ticker(ticker)
+    initialize_watchlist(database_path)
+    with sqlite3.connect(database_path, timeout=5) as connection:
+        cursor = connection.execute(
+            "DELETE FROM watchlist WHERE ticker = ?",
+            (cleaned_ticker,),
+        )
+    return cursor.rowcount == 1
+
+
 def latest_daily_change(closing_prices: pd.Series) -> tuple[float, float]:
     """Return the latest close and its change from the previous close."""
     available_prices = pd.to_numeric(closing_prices, errors="coerce").dropna()
@@ -134,11 +148,6 @@ def latest_daily_change(closing_prices: pd.Series) -> tuple[float, float]:
     return current_price, percentage_change
 
 
-def dates_are_valid(start_date: date | str, end_date: date | str) -> bool:
-    """Return True when the start date is not after the end date."""
-    return pd.Timestamp(start_date) <= pd.Timestamp(end_date)
-
-
 def readable_exchange_name(exchange: str | None) -> str:
     """Convert Yahoo's exchange code into a readable display name."""
     if not exchange:
@@ -149,18 +158,12 @@ def readable_exchange_name(exchange: str | None) -> str:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def download_stock_data(
-    ticker: str, start_date: str, end_date: str
-) -> pd.DataFrame:
-    """Download one ticker's daily prices and cache them for one hour."""
-    # yfinance treats its end date as exclusive, so add one day to include the
-    # date chosen by the user.
-    inclusive_end = pd.Timestamp(end_date) + pd.Timedelta(days=1)
-
+def download_stock_data(ticker: str) -> pd.DataFrame:
+    """Download one ticker's trailing year and cache it for one hour."""
     data = yf.download(
         ticker,
-        start=start_date,
-        end=inclusive_end.strftime("%Y-%m-%d"),
+        period="1y",
+        interval="1d",
         auto_adjust=False,
         progress=False,
         multi_level_index=False,
@@ -172,6 +175,147 @@ def download_stock_data(
 
     data.index.name = "Date"
     return data
+
+
+def latest_market_summary(stock_data: pd.DataFrame) -> dict[str, object]:
+    """Return the newest available OHLC values and one-day close return."""
+    if "Close" not in stock_data.columns:
+        raise ValueError("Closing-price data is required.")
+
+    closing_prices = pd.to_numeric(stock_data["Close"], errors="coerce")
+    available_closes = closing_prices.dropna()
+    if available_closes.empty:
+        raise ValueError("At least one closing price is required.")
+
+    latest_date = available_closes.index[-1]
+    latest_row = stock_data.loc[latest_date]
+
+    def available_number(column: str) -> float | None:
+        if column not in stock_data.columns:
+            return None
+        try:
+            value = float(latest_row[column])
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    daily_return = None
+    if len(available_closes) >= 2:
+        previous_close = float(available_closes.iloc[-2])
+        current_close = float(available_closes.iloc[-1])
+        if previous_close != 0:
+            daily_return = ((current_close / previous_close) - 1) * 100
+
+    return {
+        "date": pd.Timestamp(latest_date),
+        "open": available_number("Open"),
+        "high": available_number("High"),
+        "low": available_number("Low"),
+        "return": daily_return,
+    }
+
+
+def _available_number(value: object) -> float | None:
+    """Return a finite numeric value or None for unavailable metadata."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _format_compact_number(value: float, currency: bool = False) -> str:
+    """Format large values with familiar thousand-to-trillion suffixes."""
+    absolute_value = abs(value)
+    for threshold, suffix in (
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ):
+        if absolute_value >= threshold:
+            formatted = f"{value / threshold:,.2f}{suffix}"
+            return f"${formatted}" if currency else formatted
+    formatted = f"{value:,.2f}"
+    return f"${formatted}" if currency else formatted
+
+
+def _format_market_date(value: object) -> str | None:
+    """Return a readable date for Yahoo timestamps or date-like values."""
+    try:
+        if isinstance(value, (int, float)):
+            timestamp = pd.to_datetime(value, unit="s", utc=True)
+        else:
+            timestamp = pd.to_datetime(value, utc=True)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    return timestamp.date().isoformat()
+
+
+def format_fundamental_metrics(
+    market_info: Mapping[str, object],
+) -> list[tuple[str, str]]:
+    """Format only the company fundamentals Yahoo currently provides."""
+    metrics: list[tuple[str, str]] = []
+
+    trailing_pe = _available_number(market_info.get("trailingPE"))
+    if trailing_pe is not None:
+        metrics.append(("P/E Ratio", f"{trailing_pe:,.2f}"))
+
+    dividend_parts = []
+    dividend_rate = _available_number(market_info.get("dividendRate"))
+    if dividend_rate is not None:
+        dividend_parts.append(f"${dividend_rate:,.2f}")
+
+    dividend_yield = _available_number(market_info.get("dividendYield"))
+    if dividend_yield is not None:
+        dividend_parts.append(f"{dividend_yield:,.2f}%")
+    if dividend_parts:
+        metrics.append(("Dividend", " · ".join(dividend_parts)))
+
+    latest_dividend = _available_number(market_info.get("lastDividendValue"))
+    if latest_dividend is not None:
+        metrics.append(("Quarterly Dividend", f"${latest_dividend:,.2f}"))
+
+    trailing_eps = _available_number(market_info.get("trailingEps"))
+    if trailing_eps is not None:
+        metrics.append(("EPS", f"${trailing_eps:,.2f}"))
+
+    ex_dividend_date = _format_market_date(
+        market_info.get("exDividendDate")
+    )
+    if ex_dividend_date:
+        metrics.append(("Ex-Dividend Date", ex_dividend_date))
+
+    market_cap = _available_number(market_info.get("marketCap"))
+    if market_cap is not None:
+        metrics.append(
+            ("Market Cap", _format_compact_number(market_cap, currency=True))
+        )
+
+    shares_outstanding = _available_number(
+        market_info.get("sharesOutstanding")
+    )
+    if shares_outstanding is not None:
+        metrics.append(
+            (
+                "Shares Outstanding",
+                _format_compact_number(shares_outstanding),
+            )
+        )
+
+    return metrics
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_fundamental_metrics(ticker: str) -> list[tuple[str, str]]:
+    """Fetch and format available company fundamentals for one ticker."""
+    market_info = yf.Ticker(ticker).get_info()
+    if not isinstance(market_info, Mapping):
+        return []
+    return format_fundamental_metrics(market_info)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -379,10 +523,15 @@ def build_watchlist_table(
     """
 
 
-def render_watchlist(watchlist: list[str]) -> None:
+def render_watchlist(
+    watchlist: list[str], storage_available: bool = True
+) -> None:
     """Render a compact ordered watchlist in the sidebar."""
-    with st.sidebar.container(height=300, border=True):
+    with st.sidebar.container(height=390, border=True):
         st.subheader("Watchlist")
+        notice = st.session_state.pop("watchlist_notice", None)
+        if notice:
+            st.success(notice)
         if not watchlist:
             st.caption("Save a ticker to start your watchlist.")
             return
@@ -404,6 +553,86 @@ def render_watchlist(watchlist: list[str]) -> None:
             build_watchlist_table(snapshots),
             unsafe_allow_html=True,
         )
+
+        ticker_to_remove = st.selectbox(
+            "Ticker to delete",
+            options=watchlist,
+            key="watchlist_ticker_to_delete",
+            help="Choose the ticker you want to remove from your watchlist.",
+        )
+        delete_ticker = st.button(
+            "Delete selected ticker",
+            use_container_width=True,
+            disabled=not storage_available,
+        )
+        if delete_ticker:
+            try:
+                if remove_ticker_from_watchlist(ticker_to_remove):
+                    st.session_state["watchlist_notice"] = (
+                        f"{ticker_to_remove} was removed from your watchlist."
+                    )
+                    st.rerun()
+            except ValueError as error:
+                st.warning(str(error))
+            except sqlite3.Error:
+                st.warning("The ticker could not be removed locally.")
+
+
+def render_market_summary(stock_data: pd.DataFrame) -> None:
+    """Render the newest available daily market prices."""
+    try:
+        summary = latest_market_summary(stock_data)
+    except ValueError:
+        st.info("Latest daily market values are unavailable for this symbol.")
+        return
+    st.subheader("Latest Market Data")
+    st.caption(
+        "Newest available trading day: "
+        f"{summary['date'].date().isoformat()}"
+    )
+
+    latest_values = [
+        (
+            "Open",
+            "—" if summary["open"] is None else f"${summary['open']:,.2f}",
+        ),
+        (
+            "High",
+            "—" if summary["high"] is None else f"${summary['high']:,.2f}",
+        ),
+        (
+            "Low",
+            "—" if summary["low"] is None else f"${summary['low']:,.2f}",
+        ),
+        (
+            "Return",
+            (
+                "—"
+                if summary["return"] is None
+                else f"{summary['return']:+.2f}%"
+            ),
+        ),
+    ]
+    for column, (label, value) in zip(st.columns(4), latest_values):
+        column.metric(label, value)
+
+
+def render_fundamentals(ticker: str) -> None:
+    """Render company fundamentals only when Yahoo provides them."""
+    try:
+        metrics = get_fundamental_metrics(ticker)
+    except Exception:
+        metrics = []
+    if not metrics:
+        return
+
+    st.subheader("Company Fundamentals")
+    for start_index in range(0, len(metrics), 4):
+        metric_group = metrics[start_index : start_index + 4]
+        for column, (label, value) in zip(
+            st.columns(len(metric_group)), metric_group
+        ):
+            column.metric(label, value)
 
 
 def main() -> None:
@@ -453,11 +682,6 @@ def main() -> None:
         )
     )
 
-    default_end_date = date.today()
-    default_start_date = default_end_date - timedelta(days=365)
-    start_date = st.sidebar.date_input("Start date", value=default_start_date)
-    end_date = st.sidebar.date_input("End date", value=default_end_date)
-
     try:
         watchlist = load_watchlist()
         watchlist_storage_available = True
@@ -484,7 +708,7 @@ def main() -> None:
         except sqlite3.Error:
             st.sidebar.warning("The ticker could not be saved locally.")
 
-    render_watchlist(watchlist)
+    render_watchlist(watchlist, watchlist_storage_available)
     st.sidebar.caption("Saved locally on this app in order of addition.")
 
     if not ticker:
@@ -492,38 +716,29 @@ def main() -> None:
         st.warning("Enter a valid stock, index, or commodity symbol to begin.")
         return
 
-    if not dates_are_valid(start_date, end_date):
-        st.title("Financial Market Dashboard")
-        st.warning("The start date must be on or before the end date.")
-        return
-
     try:
         with st.spinner(f"Downloading {ticker} data..."):
-            stock_data = download_stock_data(
-                ticker,
-                start_date.isoformat(),
-                end_date.isoformat(),
-            )
+            stock_data = download_stock_data(ticker)
     except ValueError:
         st.title("Financial Market Dashboard")
         st.warning(
-            f"No data was found for {ticker} in this date range. "
-            "Check the symbol and dates, then try again."
+            f"No recent data was found for {ticker}. Check the symbol, then "
+            "try again."
         )
         return
     except Exception:
         st.title("Financial Market Dashboard")
         st.warning(
-            "The data could not be downloaded. Check the symbol, date range, "
-            "and your internet connection, then try again."
+            "The data could not be downloaded. Check the symbol and your "
+            "internet connection, then try again."
         )
         return
 
     if stock_data.empty or "Close" not in stock_data.columns:
         st.title("Financial Market Dashboard")
         st.warning(
-            f"No data was found for {ticker} in this date range. "
-            "Check the symbol and dates, then try again."
+            f"No recent data was found for {ticker}. Check the symbol, then "
+            "try again."
         )
         return
 
@@ -549,12 +764,15 @@ def main() -> None:
         config={"displaylogo": False},
     )
 
+    render_market_summary(stock_data)
+    render_fundamentals(ticker)
+
     csv_data = stock_data.to_csv().encode("utf-8")
     safe_ticker = ticker.replace("^", "").replace("=", "_")
     st.download_button(
         label="Download current data as CSV",
         data=csv_data,
-        file_name=f"{safe_ticker}_{start_date}_{end_date}.csv",
+        file_name=f"{safe_ticker}_trailing_year.csv",
         mime="text/csv",
     )
 
