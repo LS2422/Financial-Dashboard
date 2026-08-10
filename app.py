@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import re
+import sqlite3
 from datetime import date, timedelta
 from html import escape
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
 
+
+WATCHLIST_DB_PATH = Path(__file__).with_name(".watchlist.db")
+TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
 
 EXCHANGE_NAMES = {
     "ASE": "NYSE AMERICAN",
@@ -43,6 +49,66 @@ COMMON_MARKETS = {
 def clean_ticker(ticker: str) -> str:
     """Remove extra spaces and use the uppercase ticker format."""
     return ticker.strip().upper()
+
+
+def validate_ticker(ticker: str) -> str:
+    """Return a normalized ticker or raise when its format is unsafe."""
+    cleaned_ticker = clean_ticker(ticker)
+    if not TICKER_PATTERN.fullmatch(cleaned_ticker):
+        raise ValueError("Enter a valid ticker symbol.")
+    return cleaned_ticker
+
+
+def initialize_watchlist(database_path: Path = WATCHLIST_DB_PATH) -> None:
+    """Create the local ordered watchlist table when it does not exist."""
+    with sqlite3.connect(database_path, timeout=5) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                position INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL UNIQUE
+            )
+            """
+        )
+
+
+def load_watchlist(database_path: Path = WATCHLIST_DB_PATH) -> list[str]:
+    """Load watchlist tickers in their original order of addition."""
+    initialize_watchlist(database_path)
+    with sqlite3.connect(database_path, timeout=5) as connection:
+        rows = connection.execute(
+            "SELECT ticker FROM watchlist ORDER BY position"
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def add_ticker_to_watchlist(
+    ticker: str, database_path: Path = WATCHLIST_DB_PATH
+) -> bool:
+    """Add one validated ticker and return whether a new row was stored."""
+    cleaned_ticker = validate_ticker(ticker)
+    initialize_watchlist(database_path)
+    with sqlite3.connect(database_path, timeout=5) as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO watchlist (ticker) VALUES (?)",
+            (cleaned_ticker,),
+        )
+    return cursor.rowcount == 1
+
+
+def latest_daily_change(closing_prices: pd.Series) -> tuple[float, float]:
+    """Return the latest close and its change from the previous close."""
+    available_prices = pd.to_numeric(closing_prices, errors="coerce").dropna()
+    if len(available_prices) < 2:
+        raise ValueError("At least two closing prices are required.")
+
+    previous_price = float(available_prices.iloc[-2])
+    current_price = float(available_prices.iloc[-1])
+    if previous_price == 0:
+        raise ValueError("The previous closing price cannot be zero.")
+
+    percentage_change = ((current_price - previous_price) / previous_price) * 100
+    return current_price, percentage_change
 
 
 def dates_are_valid(start_date: date | str, end_date: date | str) -> bool:
