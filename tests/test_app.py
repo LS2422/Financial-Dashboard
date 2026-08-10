@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -59,6 +60,37 @@ class WatchlistPriceTests(unittest.TestCase):
 
         self.assertEqual(current_price, 110.0)
         self.assertAlmostEqual(percentage_change, 10.0)
+
+    def test_watchlist_snapshot_returns_current_price_and_daily_change(self) -> None:
+        market_data = pd.DataFrame(
+            {"Close": [200.0, 204.0]},
+            index=pd.to_datetime(["2026-08-07", "2026-08-10"]),
+        )
+
+        with patch.object(app.yf, "download", return_value=market_data):
+            current_price, percentage_change = app.download_watchlist_snapshot(
+                "AAPL"
+            )
+
+        self.assertEqual(current_price, 204.0)
+        self.assertAlmostEqual(percentage_change, 2.0)
+
+
+class WatchlistDisplayTests(unittest.TestCase):
+    def test_watchlist_table_keeps_compact_ranked_ticker_rows(self) -> None:
+        table_html = app.build_watchlist_table(
+            [
+                ("AAPL", 229.35, 1.42),
+                ("MSFT", 523.61, -0.68),
+            ]
+        )
+
+        self.assertLess(table_html.index("AAPL"), table_html.index("MSFT"))
+        self.assertIn("$229.35", table_html)
+        self.assertIn("+1.42%", table_html)
+        self.assertIn("-0.68%", table_html)
+        self.assertIn("white-space: nowrap", table_html)
+        self.assertNotIn("Apple Inc", table_html)
 
 
 if __name__ == "__main__":

@@ -151,6 +151,22 @@ def download_stock_data(
     return data
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def download_watchlist_snapshot(ticker: str) -> tuple[float, float]:
+    """Return the latest price and one-day change for a watchlist ticker."""
+    data = yf.download(
+        ticker,
+        period="5d",
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        multi_level_index=False,
+    )
+    if data.empty or "Close" not in data.columns:
+        raise ValueError("Yahoo Finance returned no recent closing prices.")
+    return latest_daily_change(data["Close"])
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_details(ticker: str) -> tuple[str, str]:
     """Return a readable market name and exchange for one symbol."""
@@ -229,6 +245,139 @@ def build_close_figure(stock_data: pd.DataFrame):
     return figure
 
 
+def build_watchlist_table(
+    snapshots: list[tuple[str, float | None, float | None]],
+) -> str:
+    """Build a compact, non-wrapping watchlist table from price snapshots."""
+    table_rows = []
+    for rank, (ticker, current_price, percentage_change) in enumerate(
+        snapshots, start=1
+    ):
+        if current_price is None or percentage_change is None:
+            price_text = "—"
+            change_text = "—"
+            change_class = "unavailable"
+        else:
+            price_text = f"${current_price:,.2f}"
+            change_text = f"{percentage_change:+.2f}%"
+            change_class = (
+                "positive"
+                if percentage_change > 0
+                else "negative" if percentage_change < 0 else "neutral"
+            )
+
+        table_rows.append(
+            "<tr>"
+            f'<td class="rank">{rank}</td>'
+            f'<td class="ticker">{escape(ticker)}</td>'
+            f'<td class="price">{price_text}</td>'
+            f'<td class="change {change_class}">{change_text}</td>'
+            "</tr>"
+        )
+
+    return f"""
+        <style>
+        .watchlist-table {{
+            border-collapse: collapse;
+            font-size: 0.78rem;
+            table-layout: fixed;
+            width: 100%;
+        }}
+        .watchlist-table th,
+        .watchlist-table td {{
+            border-bottom: 1px solid rgba(139, 145, 157, 0.20);
+            overflow: hidden;
+            padding: 0.45rem 0.08rem;
+            text-overflow: clip;
+            white-space: nowrap;
+        }}
+        .watchlist-table th {{
+            color: #8b919d;
+            font-weight: 500;
+            text-align: right;
+        }}
+        .watchlist-table .rank {{
+            color: #8b919d;
+            text-align: left;
+            width: 13%;
+        }}
+        .watchlist-table .ticker {{
+            font-weight: 700;
+            text-align: left;
+            width: 25%;
+        }}
+        .watchlist-table .price {{
+            text-align: right;
+            width: 34%;
+        }}
+        .watchlist-table .change {{
+            font-weight: 600;
+            text-align: right;
+            width: 28%;
+        }}
+        .watchlist-table .positive {{ color: #22c55e; }}
+        .watchlist-table .negative {{ color: #ef6461; }}
+        .watchlist-table .neutral,
+        .watchlist-table .unavailable {{ color: #8b919d; }}
+        .watchlist-caption {{
+            height: 1px;
+            margin: -1px;
+            overflow: hidden;
+            padding: 0;
+            position: absolute;
+            width: 1px;
+        }}
+        </style>
+        <table class="watchlist-table">
+            <caption class="watchlist-caption">
+                Saved tickers ranked by order of addition
+            </caption>
+            <colgroup>
+                <col style="width: 13%">
+                <col style="width: 25%">
+                <col style="width: 34%">
+                <col style="width: 28%">
+            </colgroup>
+            <thead>
+                <tr>
+                    <th scope="col">No.</th>
+                    <th scope="col" style="text-align: left">Ticker</th>
+                    <th scope="col">Price</th>
+                    <th scope="col">1D</th>
+                </tr>
+            </thead>
+            <tbody>{''.join(table_rows)}</tbody>
+        </table>
+    """
+
+
+def render_watchlist(watchlist: list[str]) -> None:
+    """Render a compact ranked watchlist in the sidebar."""
+    with st.sidebar.container(height=300, border=True):
+        st.subheader("Watchlist")
+        if not watchlist:
+            st.caption("Save a ticker to start your watchlist.")
+            return
+
+        snapshots = []
+        for watchlist_ticker in watchlist:
+            try:
+                current_price, percentage_change = download_watchlist_snapshot(
+                    watchlist_ticker
+                )
+            except Exception:
+                current_price = None
+                percentage_change = None
+            snapshots.append(
+                (watchlist_ticker, current_price, percentage_change)
+            )
+
+        st.markdown(
+            build_watchlist_table(snapshots),
+            unsafe_allow_html=True,
+        )
+
+
 def main() -> None:
     """Display the Streamlit dashboard."""
     st.set_page_config(page_title="Stock Dashboard", page_icon="📈", layout="wide")
@@ -243,7 +392,7 @@ def main() -> None:
 
         p.market-identity {
             color: #8b919d;
-            font-size: 1rem !important;
+            font-size: 1.5rem !important;
             letter-spacing: 0.02em;
             margin-top: -0.75rem;
             margin-bottom: 1.5rem;
@@ -269,6 +418,35 @@ def main() -> None:
     default_start_date = default_end_date - timedelta(days=365)
     start_date = st.sidebar.date_input("Start date", value=default_start_date)
     end_date = st.sidebar.date_input("End date", value=default_end_date)
+
+    try:
+        watchlist = load_watchlist()
+        watchlist_storage_available = True
+    except sqlite3.Error:
+        watchlist = []
+        watchlist_storage_available = False
+        st.sidebar.warning("The local watchlist storage is unavailable.")
+
+    add_to_watchlist = st.sidebar.button(
+        "Add to watchlist",
+        type="primary",
+        use_container_width=True,
+        disabled=not ticker or not watchlist_storage_available,
+    )
+    if add_to_watchlist:
+        try:
+            if add_ticker_to_watchlist(ticker):
+                watchlist.append(validate_ticker(ticker))
+                st.sidebar.success(f"{ticker} was added to your watchlist.")
+            else:
+                st.sidebar.info(f"{ticker} is already in your watchlist.")
+        except ValueError as error:
+            st.sidebar.warning(str(error))
+        except sqlite3.Error:
+            st.sidebar.warning("The ticker could not be saved locally.")
+
+    render_watchlist(watchlist)
+    st.sidebar.caption("Saved locally on this app in order of addition.")
 
     if not ticker:
         st.title("Financial Market Dashboard")
