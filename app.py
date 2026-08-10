@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Mapping
 from datetime import date, timedelta
 from html import escape
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pandas as pd
 import plotly.express as px
@@ -57,6 +59,27 @@ def validate_ticker(ticker: str) -> str:
     if not TICKER_PATTERN.fullmatch(cleaned_ticker):
         raise ValueError("Enter a valid ticker symbol.")
     return cleaned_ticker
+
+
+def selected_ticker_from_query(query_params: Mapping[str, object]) -> str:
+    """Return one validated ticker selected through the page URL."""
+    selected_ticker = query_params.get("ticker", "")
+    if isinstance(selected_ticker, list):
+        selected_ticker = selected_ticker[-1] if selected_ticker else ""
+    if not isinstance(selected_ticker, str):
+        return ""
+
+    try:
+        return validate_ticker(selected_ticker)
+    except ValueError:
+        return ""
+
+
+def clear_selected_ticker_query() -> None:
+    """Clear a watchlist URL selection when the search field is edited."""
+    if "ticker" in st.query_params:
+        del st.query_params["ticker"]
+    st.session_state.pop("watchlist_query_ticker", None)
 
 
 def initialize_watchlist(database_path: Path = WATCHLIST_DB_PATH) -> None:
@@ -250,9 +273,7 @@ def build_watchlist_table(
 ) -> str:
     """Build a compact, non-wrapping watchlist table from price snapshots."""
     table_rows = []
-    for rank, (ticker, current_price, percentage_change) in enumerate(
-        snapshots, start=1
-    ):
+    for ticker, current_price, percentage_change in snapshots:
         if current_price is None or percentage_change is None:
             price_text = "—"
             change_text = "—"
@@ -266,11 +287,15 @@ def build_watchlist_table(
                 else "negative" if percentage_change < 0 else "neutral"
             )
 
+        ticker_query = urlencode({"ticker": ticker})
+        safe_ticker = escape(ticker)
         table_rows.append(
             "<tr>"
-            f'<td class="rank">{rank}</td>'
-            f'<td class="ticker">{escape(ticker)}</td>'
-            f'<td class="price">{price_text}</td>'
+            '<td class="ticker">'
+            f'<a class="ticker-link" href="?{ticker_query}" target="_self" '
+            f'aria-label="Show {safe_ticker} market trend">{safe_ticker}</a>'
+            "</td>"
+            f'<td class="price {change_class}">{price_text}</td>'
             f'<td class="change {change_class}">{change_text}</td>'
             "</tr>"
         )
@@ -278,6 +303,7 @@ def build_watchlist_table(
     return f"""
         <style>
         .watchlist-table {{
+            border: none !important;
             border-collapse: collapse;
             font-size: 0.78rem;
             table-layout: fixed;
@@ -285,9 +311,9 @@ def build_watchlist_table(
         }}
         .watchlist-table th,
         .watchlist-table td {{
-            border-bottom: 1px solid rgba(139, 145, 157, 0.20);
+            border: none !important;
             overflow: hidden;
-            padding: 0.45rem 0.08rem;
+            padding: 0.5rem 0.08rem;
             text-overflow: clip;
             white-space: nowrap;
         }}
@@ -296,24 +322,28 @@ def build_watchlist_table(
             font-weight: 500;
             text-align: right;
         }}
-        .watchlist-table .rank {{
-            color: #8b919d;
-            text-align: left;
-            width: 13%;
-        }}
         .watchlist-table .ticker {{
             font-weight: 700;
             text-align: left;
-            width: 25%;
+            width: 34%;
         }}
         .watchlist-table .price {{
+            font-weight: 600;
             text-align: right;
-            width: 34%;
+            width: 36%;
         }}
         .watchlist-table .change {{
             font-weight: 600;
             text-align: right;
-            width: 28%;
+            width: 30%;
+        }}
+        .watchlist-table .ticker-link {{
+            color: inherit;
+            text-decoration: none;
+        }}
+        .watchlist-table .ticker-link:hover,
+        .watchlist-table .ticker-link:focus-visible {{
+            text-decoration: underline;
         }}
         .watchlist-table .positive {{ color: #22c55e; }}
         .watchlist-table .negative {{ color: #ef6461; }}
@@ -330,17 +360,15 @@ def build_watchlist_table(
         </style>
         <table class="watchlist-table">
             <caption class="watchlist-caption">
-                Saved tickers ranked by order of addition
+                Saved tickers in order of addition
             </caption>
             <colgroup>
-                <col style="width: 13%">
-                <col style="width: 25%">
                 <col style="width: 34%">
-                <col style="width: 28%">
+                <col style="width: 36%">
+                <col style="width: 30%">
             </colgroup>
             <thead>
                 <tr>
-                    <th scope="col">No.</th>
                     <th scope="col" style="text-align: left">Ticker</th>
                     <th scope="col">Price</th>
                     <th scope="col">1D</th>
@@ -352,7 +380,7 @@ def build_watchlist_table(
 
 
 def render_watchlist(watchlist: list[str]) -> None:
-    """Render a compact ranked watchlist in the sidebar."""
+    """Render a compact ordered watchlist in the sidebar."""
     with st.sidebar.container(height=300, border=True):
         st.subheader("Watchlist")
         if not watchlist:
@@ -403,14 +431,25 @@ def main() -> None:
     )
 
     st.sidebar.header("Market search")
+    query_ticker = selected_ticker_from_query(st.query_params)
+    previous_query_ticker = st.session_state.get("watchlist_query_ticker")
+    if "ticker_input" not in st.session_state:
+        st.session_state["ticker_input"] = query_ticker
+    elif query_ticker and query_ticker != previous_query_ticker:
+        st.session_state["ticker_input"] = query_ticker
+    if query_ticker:
+        st.session_state["watchlist_query_ticker"] = query_ticker
+
     ticker = clean_ticker(
         st.sidebar.text_input(
             "Enter a stock, index, or commodity symbol",
+            key="ticker_input",
             placeholder="Type a market symbol",
             help=(
                 "Enter the exact Yahoo Finance symbol. Examples: AAPL (stock), "
                 "^GSPC (index), or GC=F (commodity)."
             ),
+            on_change=clear_selected_ticker_query,
         )
     )
 

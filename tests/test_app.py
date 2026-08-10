@@ -77,7 +77,9 @@ class WatchlistPriceTests(unittest.TestCase):
 
 
 class WatchlistDisplayTests(unittest.TestCase):
-    def test_watchlist_table_keeps_compact_ranked_ticker_rows(self) -> None:
+    def test_watchlist_table_is_borderless_clickable_and_uses_shared_colours(
+        self,
+    ) -> None:
         table_html = app.build_watchlist_table(
             [
                 ("AAPL", 229.35, 1.42),
@@ -90,7 +92,34 @@ class WatchlistDisplayTests(unittest.TestCase):
         self.assertIn("+1.42%", table_html)
         self.assertIn("-0.68%", table_html)
         self.assertIn("white-space: nowrap", table_html)
+        self.assertIn('href="?ticker=AAPL"', table_html)
+        self.assertIn('class="price positive"', table_html)
+        self.assertIn('class="change positive"', table_html)
+        self.assertIn('class="price negative"', table_html)
+        self.assertIn("border: none !important", table_html)
+        self.assertNotIn("border-bottom", table_html)
+        self.assertNotIn("No.", table_html)
+        self.assertNotIn('class="rank"', table_html)
         self.assertNotIn("Apple Inc", table_html)
+
+    def test_watchlist_link_url_encodes_special_ticker_characters(self) -> None:
+        table_html = app.build_watchlist_table([("^GSPC", 6400.0, 0.5)])
+
+        self.assertIn('href="?ticker=%5EGSPC"', table_html)
+
+
+class WatchlistNavigationTests(unittest.TestCase):
+    def test_query_ticker_is_validated_and_normalized(self) -> None:
+        self.assertEqual(
+            app.selected_ticker_from_query({"ticker": " msft "}),
+            "MSFT",
+        )
+
+    def test_invalid_query_ticker_is_ignored(self) -> None:
+        self.assertEqual(
+            app.selected_ticker_from_query({"ticker": "../../etc/passwd"}),
+            "",
+        )
 
 
 if __name__ == "__main__":
