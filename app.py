@@ -16,6 +16,58 @@ import yfinance as yf
 
 WATCHLIST_DB_PATH = Path(__file__).with_name(".watchlist.db")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
+MOMENTUM_COLOURS = {
+    "positive": "#22c55e",
+    "negative": "#ef6461",
+    "neutral": "#8b919d",
+}
+METRIC_GRID_STYLES = """
+.metric-grid {
+    display: grid;
+    gap: 0.25rem 1.5rem;
+    margin-bottom: 1.5rem;
+    width: 100%;
+}
+.metric-grid--latest {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.metric-grid--fundamentals {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.market-metric {
+    min-width: 0;
+    padding: 0.75rem 0;
+}
+.metric-label,
+.metric-value {
+    font-size: 1rem !important;
+    line-height: 1.4;
+    margin: 0;
+}
+.metric-label {
+    color: #a4a9b3;
+    font-weight: 600;
+}
+.metric-value {
+    font-weight: 600;
+    margin-top: 0.25rem;
+    overflow-wrap: anywhere;
+}
+.metric-value.positive { color: #22c55e; }
+.metric-value.negative { color: #ef6461; }
+.metric-value.neutral { color: inherit; }
+@media (max-width: 900px) {
+    .metric-grid--latest {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+@media (max-width: 520px) {
+    .metric-grid--latest,
+    .metric-grid--fundamentals {
+        grid-template-columns: 1fr;
+    }
+}
+"""
 
 EXCHANGE_NAMES = {
     "ASE": "NYSE AMERICAN",
@@ -178,7 +230,7 @@ def download_stock_data(ticker: str) -> pd.DataFrame:
 
 
 def latest_market_summary(stock_data: pd.DataFrame) -> dict[str, object]:
-    """Return the newest available OHLC values and one-day close return."""
+    """Return newest OHLCV values and the one-day close return."""
     if "Close" not in stock_data.columns:
         raise ValueError("Closing-price data is required.")
 
@@ -211,8 +263,20 @@ def latest_market_summary(stock_data: pd.DataFrame) -> dict[str, object]:
         "open": available_number("Open"),
         "high": available_number("High"),
         "low": available_number("Low"),
+        "volume": available_number("Volume"),
         "return": daily_return,
     }
+
+
+def momentum_direction(return_value: float | None) -> str:
+    """Return the semantic colour direction for a daily return."""
+    if return_value is None or not math.isfinite(return_value):
+        return "neutral"
+    if return_value > 0:
+        return "positive"
+    if return_value < 0:
+        return "negative"
+    return "neutral"
 
 
 def _available_number(value: object) -> float | None:
@@ -254,6 +318,37 @@ def _format_market_date(value: object) -> str | None:
     return timestamp.date().isoformat()
 
 
+def build_metric_grid(
+    metrics: list[tuple[str, str, str]],
+    layout: str,
+    accessible_name: str,
+) -> str:
+    """Build a responsive, accessible metric grid with balanced type sizes."""
+    if layout not in {"latest", "fundamentals"}:
+        raise ValueError("Unknown metric-grid layout.")
+
+    metric_rows = []
+    for label, value, direction in metrics:
+        safe_direction = (
+            direction
+            if direction in {"positive", "negative", "neutral"}
+            else "neutral"
+        )
+        metric_rows.append(
+            '<div class="market-metric" role="listitem">'
+            f'<div class="metric-label">{escape(label)}</div>'
+            f'<div class="metric-value {safe_direction}">{escape(value)}</div>'
+            "</div>"
+        )
+
+    return f"""
+        <div class="metric-grid metric-grid--{layout}" role="list"
+             aria-label="{escape(accessible_name)}">
+            {''.join(metric_rows)}
+        </div>
+    """
+
+
 def format_fundamental_metrics(
     market_info: Mapping[str, object],
 ) -> list[tuple[str, str]]:
@@ -264,20 +359,9 @@ def format_fundamental_metrics(
     if trailing_pe is not None:
         metrics.append(("P/E Ratio", f"{trailing_pe:,.2f}"))
 
-    dividend_parts = []
     dividend_rate = _available_number(market_info.get("dividendRate"))
     if dividend_rate is not None:
-        dividend_parts.append(f"${dividend_rate:,.2f}")
-
-    dividend_yield = _available_number(market_info.get("dividendYield"))
-    if dividend_yield is not None:
-        dividend_parts.append(f"{dividend_yield:,.2f}%")
-    if dividend_parts:
-        metrics.append(("Dividend", " · ".join(dividend_parts)))
-
-    latest_dividend = _available_number(market_info.get("lastDividendValue"))
-    if latest_dividend is not None:
-        metrics.append(("Quarterly Dividend", f"${latest_dividend:,.2f}"))
+        metrics.append(("Dividend", f"${dividend_rate:,.2f}"))
 
     trailing_eps = _available_number(market_info.get("trailingEps"))
     if trailing_eps is not None:
@@ -392,7 +476,9 @@ def fallback_market_details(ticker: str) -> tuple[str, str]:
 
 
 def build_close_figure(stock_data: pd.DataFrame):
-    """Create the closing-value chart without persistent point markers."""
+    """Create a close chart coloured by the newest one-day momentum."""
+    summary = latest_market_summary(stock_data)
+    direction = momentum_direction(summary["return"])
     figure = px.line(
         stock_data,
         x=stock_data.index,
@@ -401,7 +487,7 @@ def build_close_figure(stock_data: pd.DataFrame):
         labels={"Date": "Date", "Close": "Closing value (USD)"},
     )
     figure.update_traces(
-        line={"color": "#22c55e", "width": 2.5},
+        line={"color": MOMENTUM_COLOURS[direction], "width": 2.5},
         hovertemplate=(
             "Date: %{x|%Y-%m-%d}<br>"
             "Close: %{y:,.2f} USD"
@@ -591,18 +677,22 @@ def render_market_summary(stock_data: pd.DataFrame) -> None:
         f"{summary['date'].date().isoformat()}"
     )
 
+    return_direction = momentum_direction(summary["return"])
     latest_values = [
         (
             "Open",
             "—" if summary["open"] is None else f"${summary['open']:,.2f}",
+            "neutral",
         ),
         (
             "High",
             "—" if summary["high"] is None else f"${summary['high']:,.2f}",
+            "neutral",
         ),
         (
             "Low",
             "—" if summary["low"] is None else f"${summary['low']:,.2f}",
+            "neutral",
         ),
         (
             "Return",
@@ -611,10 +701,26 @@ def render_market_summary(stock_data: pd.DataFrame) -> None:
                 if summary["return"] is None
                 else f"{summary['return']:+.2f}%"
             ),
+            return_direction,
+        ),
+        (
+            "Volume",
+            (
+                "—"
+                if summary["volume"] is None
+                else _format_compact_number(summary["volume"])
+            ),
+            "neutral",
         ),
     ]
-    for column, (label, value) in zip(st.columns(4), latest_values):
-        column.metric(label, value)
+    st.markdown(
+        build_metric_grid(
+            latest_values,
+            layout="latest",
+            accessible_name="Latest market data",
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def render_fundamentals(ticker: str) -> None:
@@ -627,12 +733,17 @@ def render_fundamentals(ticker: str) -> None:
         return
 
     st.subheader("Company Fundamentals")
-    for start_index in range(0, len(metrics), 4):
-        metric_group = metrics[start_index : start_index + 4]
-        for column, (label, value) in zip(
-            st.columns(len(metric_group)), metric_group
-        ):
-            column.metric(label, value)
+    st.markdown(
+        build_metric_grid(
+            [
+                (label, value, "neutral")
+                for label, value in metrics
+            ],
+            layout="fundamentals",
+            accessible_name="Company fundamentals",
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:
@@ -654,6 +765,9 @@ def main() -> None:
             margin-top: -0.75rem;
             margin-bottom: 1.5rem;
         }
+        """
+        + METRIC_GRID_STYLES
+        + """
         </style>
         """,
         unsafe_allow_html=True,

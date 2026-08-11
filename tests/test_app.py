@@ -9,7 +9,9 @@ import app
 
 
 class CloseFigureTests(unittest.TestCase):
-    def test_close_figure_uses_usd_axis_and_no_persistent_markers(self) -> None:
+    def test_positive_return_uses_green_line_without_persistent_markers(
+        self,
+    ) -> None:
         stock_data = pd.DataFrame(
             {"Close": [100.0, 101.5]},
             index=pd.to_datetime(["2026-08-06", "2026-08-07"]),
@@ -19,7 +21,18 @@ class CloseFigureTests(unittest.TestCase):
 
         self.assertEqual(figure.layout.yaxis.title.text, "Closing value (USD)")
         self.assertEqual(figure.data[0].mode, "lines")
+        self.assertEqual(figure.data[0].line.color, "#22c55e")
         self.assertIn("USD", figure.data[0].hovertemplate)
+
+    def test_negative_return_uses_red_line(self) -> None:
+        stock_data = pd.DataFrame(
+            {"Close": [101.5, 100.0]},
+            index=pd.to_datetime(["2026-08-06", "2026-08-07"]),
+        )
+
+        figure = app.build_close_figure(stock_data)
+
+        self.assertEqual(figure.data[0].line.color, "#ef6461")
 
 
 class WatchlistStorageTests(unittest.TestCase):
@@ -169,6 +182,7 @@ class MarketSummaryTests(unittest.TestCase):
                 "High": [106.0, 109.0, 112.0],
                 "Low": [99.0, 104.0, 107.0],
                 "Close": [104.0, None, 110.0],
+                "Volume": [1_000_000, 1_100_000, 1_250_000],
             },
             index=pd.to_datetime(
                 ["2026-08-06", "2026-08-07", "2026-08-10"]
@@ -181,6 +195,7 @@ class MarketSummaryTests(unittest.TestCase):
         self.assertEqual(summary["open"], 108.0)
         self.assertEqual(summary["high"], 112.0)
         self.assertEqual(summary["low"], 107.0)
+        self.assertEqual(summary["volume"], 1_250_000.0)
         self.assertAlmostEqual(summary["return"], (110.0 / 104.0 - 1) * 100)
 
     def test_fundamental_metrics_include_only_available_values(self) -> None:
@@ -202,8 +217,7 @@ class MarketSummaryTests(unittest.TestCase):
             metrics,
             [
                 ("P/E Ratio", "31.23"),
-                ("Dividend", "$1.04 · 0.42%"),
-                ("Quarterly Dividend", "$0.26"),
+                ("Dividend", "$1.04"),
                 ("EPS", "$7.18"),
                 ("Ex-Dividend Date", "2026-08-14"),
                 ("Market Cap", "$3.42T"),
@@ -222,6 +236,26 @@ class MarketSummaryTests(unittest.TestCase):
         )
 
         self.assertEqual(metrics, [("Market Cap", "$2.50M")])
+
+    def test_metric_grid_uses_equal_label_and_value_sizes_and_two_columns(
+        self,
+    ) -> None:
+        metric_html = app.build_metric_grid(
+            [
+                ("P/E Ratio", "31.23", "neutral"),
+                ("Return", "-1.08%", "negative"),
+            ],
+            layout="fundamentals",
+            accessible_name="Company fundamentals",
+        )
+
+        self.assertIn("metric-grid--fundamentals", metric_html)
+        self.assertIn(
+            "grid-template-columns: repeat(2", app.METRIC_GRID_STYLES
+        )
+        self.assertIn("font-size: 1rem", app.METRIC_GRID_STYLES)
+        self.assertIn('class="metric-value negative"', metric_html)
+        self.assertNotIn("font-size: 2", app.METRIC_GRID_STYLES)
 
 
 if __name__ == "__main__":
