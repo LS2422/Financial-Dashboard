@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from datetime import date, timedelta
 from html import escape
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import pandas as pd
 import plotly.express as px
@@ -68,6 +68,36 @@ METRIC_GRID_STYLES = """
     .metric-grid--fundamentals {
         grid-template-columns: 1fr;
     }
+}
+"""
+NEWS_STYLES = """
+.news-list {
+    list-style: none;
+    margin: 0 0 1.5rem;
+    padding: 0;
+}
+.news-item {
+    border-bottom: 1px solid rgba(164, 169, 179, 0.20);
+    padding: 0.875rem 0;
+}
+.news-item:last-child {
+    border-bottom: none;
+}
+.news-link {
+    color: inherit !important;
+    font-size: 1rem;
+    font-weight: 600;
+    line-height: 1.4;
+    text-decoration: none !important;
+}
+.news-link:hover,
+.news-link:focus-visible {
+    text-decoration: underline !important;
+}
+.news-meta {
+    color: #a4a9b3;
+    font-size: 0.875rem;
+    margin-top: 0.25rem;
 }
 """
 
@@ -936,6 +966,188 @@ def render_fundamentals(ticker: str) -> None:
     )
 
 
+def _safe_yahoo_news_url(value: object) -> str | None:
+    """Allow only HTTPS Yahoo Finance article links."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    try:
+        parsed_url = urlparse(candidate)
+        port = parsed_url.port
+    except ValueError:
+        return None
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.hostname != "finance.yahoo.com"
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or port not in {None, 443}
+    ):
+        return None
+    return candidate
+
+
+def _compact_news_text(value: object, maximum_length: int) -> str:
+    """Normalize and bound text received from Yahoo's news feed."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:maximum_length]
+
+
+def _news_timestamp(value: object) -> pd.Timestamp | None:
+    """Normalize epoch or ISO publication times to UTC."""
+    try:
+        if isinstance(value, (int, float)):
+            timestamp = pd.to_datetime(value, unit="s", utc=True)
+        else:
+            timestamp = pd.to_datetime(value, utc=True)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    return pd.Timestamp(timestamp)
+
+
+def normalize_news_items(
+    raw_news: object,
+    ticker: str,
+    limit: int = 3,
+) -> list[dict[str, str]]:
+    """Return the newest relevant, display-safe Yahoo Finance stories."""
+    if not isinstance(raw_news, list):
+        return []
+
+    normalized_ticker = clean_ticker(ticker)
+    candidates: list[tuple[pd.Timestamp, dict[str, str]]] = []
+    seen_urls: set[str] = set()
+
+    for raw_item in raw_news:
+        if not isinstance(raw_item, Mapping):
+            continue
+        nested_content = raw_item.get("content")
+        content = (
+            nested_content if isinstance(nested_content, Mapping) else raw_item
+        )
+
+        related_tickers = raw_item.get("relatedTickers")
+        if isinstance(related_tickers, (list, tuple, set)):
+            normalized_relations = {
+                clean_ticker(value)
+                for value in related_tickers
+                if isinstance(value, str)
+            }
+            if (
+                normalized_relations
+                and normalized_ticker not in normalized_relations
+            ):
+                continue
+
+        title = _compact_news_text(content.get("title"), 180)
+        provider_data = content.get("provider")
+        if isinstance(provider_data, Mapping):
+            publisher_value = provider_data.get("displayName")
+        else:
+            publisher_value = content.get("publisher")
+        publisher = _compact_news_text(publisher_value, 80) or "Yahoo Finance"
+
+        publication_value = content.get("pubDate")
+        if publication_value is None:
+            publication_value = content.get("providerPublishTime")
+        publication_time = _news_timestamp(publication_value)
+
+        url_candidates: list[object] = [content.get("link")]
+        for key in ("clickThroughUrl", "canonicalUrl"):
+            url_data = content.get(key)
+            if isinstance(url_data, Mapping):
+                url_candidates.append(url_data.get("url"))
+        article_url = next(
+            (
+                safe_url
+                for value in url_candidates
+                if (safe_url := _safe_yahoo_news_url(value)) is not None
+            ),
+            None,
+        )
+
+        if (
+            not title
+            or publication_time is None
+            or article_url is None
+            or article_url in seen_urls
+        ):
+            continue
+        seen_urls.add(article_url)
+        candidates.append(
+            (
+                publication_time,
+                {
+                    "title": title,
+                    "publisher": publisher,
+                    "published": publication_time.strftime(
+                        "%Y-%m-%d %H:%M UTC"
+                    ),
+                    "url": article_url,
+                },
+            )
+        )
+
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    safe_limit = max(0, min(int(limit), 10))
+    return [item for _, item in candidates[:safe_limit]]
+
+
+def build_news_list(news_items: list[dict[str, str]]) -> str:
+    """Build an accessible compact list from normalized news stories."""
+    story_rows = []
+    for item in news_items:
+        story_rows.append(
+            '<li class="news-item">'
+            f'<a class="news-link" href="{escape(item["url"], quote=True)}" '
+            'target="_blank" rel="noopener noreferrer">'
+            f'{escape(item["title"])}'
+            "</a>"
+            '<div class="news-meta">'
+            f'{escape(item["publisher"])} · {escape(item["published"])}'
+            "</div>"
+            "</li>"
+        )
+    return (
+        '<ul class="news-list" aria-label="Latest Yahoo Finance news">'
+        f'{"".join(story_rows)}'
+        "</ul>"
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_latest_news(ticker: str) -> list[dict[str, str]]:
+    """Fetch and normalize the newest Yahoo Finance ticker stories."""
+    search_result = yf.Search(
+        ticker,
+        max_results=1,
+        news_count=12,
+        lists_count=0,
+        include_cb=False,
+        include_nav_links=False,
+        include_research=False,
+        include_cultural_assets=False,
+        recommended=0,
+    )
+    return normalize_news_items(search_result.news, ticker, limit=3)
+
+
+def render_latest_news(ticker: str) -> None:
+    """Render the three newest Yahoo Finance stories for a ticker."""
+    st.subheader("Latest News")
+    try:
+        news_items = get_latest_news(ticker)
+    except Exception:
+        news_items = []
+    if not news_items:
+        st.info("No recent Yahoo Finance news is available for this symbol.")
+        return
+    st.markdown(build_news_list(news_items), unsafe_allow_html=True)
+
+
 def main() -> None:
     """Display the Streamlit dashboard."""
     st.set_page_config(page_title="Stock Dashboard", page_icon="📈", layout="wide")
@@ -957,6 +1169,7 @@ def main() -> None:
         }
         """
         + METRIC_GRID_STYLES
+        + NEWS_STYLES
         + """
         </style>
         """,
@@ -1091,6 +1304,7 @@ def main() -> None:
 
     render_market_summary(complete_stock_data)
     render_fundamentals(ticker)
+    render_latest_news(ticker)
 
     csv_data = stock_data.to_csv().encode("utf-8")
     safe_ticker = ticker.replace("^", "").replace("=", "_")

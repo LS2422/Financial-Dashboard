@@ -420,5 +420,111 @@ class MarketSummaryTests(unittest.TestCase):
         self.assertIn(("RSI (14D)", "56.00", "neutral"), metrics)
 
 
+class LatestNewsTests(unittest.TestCase):
+    def test_news_parser_returns_three_newest_relevant_safe_stories(self) -> None:
+        raw_news = [
+            {
+                "title": "Older Apple story",
+                "publisher": "Publisher A",
+                "link": "https://finance.yahoo.com/news/older-apple",
+                "providerPublishTime": 1_786_440_000,
+                "relatedTickers": ["AAPL"],
+            },
+            {
+                "title": "Newest unrelated story",
+                "publisher": "Publisher B",
+                "link": "https://finance.yahoo.com/news/unrelated",
+                "providerPublishTime": 1_786_460_000,
+                "relatedTickers": ["MSFT"],
+            },
+            {
+                "title": "Unsafe Apple link",
+                "publisher": "Publisher C",
+                "link": "javascript:alert(1)",
+                "providerPublishTime": 1_786_455_000,
+                "relatedTickers": ["AAPL"],
+            },
+            {
+                "title": "Malformed Apple link",
+                "publisher": "Publisher C",
+                "link": "https://finance.yahoo.com:invalid/news/apple",
+                "providerPublishTime": 1_786_454_000,
+                "relatedTickers": ["AAPL"],
+            },
+            {
+                "title": "Newest Apple story",
+                "publisher": "Publisher D",
+                "link": "https://finance.yahoo.com/news/newest-apple",
+                "providerPublishTime": 1_786_450_000,
+                "relatedTickers": ["AAPL"],
+            },
+            {
+                "title": "Second Apple story",
+                "publisher": "Publisher E",
+                "link": "https://finance.yahoo.com/news/second-apple",
+                "providerPublishTime": 1_786_445_000,
+                "relatedTickers": ["AAPL"],
+            },
+            {
+                "title": "Fourth Apple story",
+                "publisher": "Publisher F",
+                "link": "https://finance.yahoo.com/news/fourth-apple",
+                "providerPublishTime": 1_786_430_000,
+                "relatedTickers": ["AAPL"],
+            },
+        ]
+
+        news_items = app.normalize_news_items(raw_news, "AAPL", limit=3)
+
+        self.assertEqual(
+            [item["title"] for item in news_items],
+            [
+                "Newest Apple story",
+                "Second Apple story",
+                "Older Apple story",
+            ],
+        )
+        self.assertTrue(
+            all(item["url"].startswith("https://finance.yahoo.com/") for item in news_items)
+        )
+
+    def test_nested_news_schema_and_html_are_safely_rendered(self) -> None:
+        raw_news = [
+            {
+                "content": {
+                    "title": '<script>alert("news")</script> Apple update',
+                    "provider": {"displayName": "Yahoo & Partners"},
+                    "pubDate": "2026-08-11T14:30:39Z",
+                    "clickThroughUrl": {
+                        "url": "https://finance.yahoo.com/news/apple-update"
+                    },
+                }
+            }
+        ]
+
+        news_items = app.normalize_news_items(raw_news, "AAPL")
+        news_html = app.build_news_list(news_items)
+
+        self.assertEqual(len(news_items), 1)
+        self.assertIn("2026-08-11 14:30 UTC", news_html)
+        self.assertIn("Yahoo &amp; Partners", news_html)
+        self.assertIn("&lt;script&gt;", news_html)
+        self.assertNotIn("<script>", news_html)
+        self.assertIn('rel="noopener noreferrer"', news_html)
+
+    def test_news_section_shows_an_explicit_empty_state(self) -> None:
+        with (
+            patch.object(app, "get_latest_news", return_value=[]),
+            patch.object(app.st, "subheader") as subheader,
+            patch.object(app.st, "info") as info,
+        ):
+            app.render_latest_news("AAPL")
+
+        subheader.assert_called_once_with("Latest News")
+        info.assert_called_once_with(
+            "No recent Yahoo Finance news is available for this symbol."
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
