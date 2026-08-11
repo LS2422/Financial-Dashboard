@@ -4,6 +4,7 @@ import math
 import re
 import sqlite3
 from collections.abc import Mapping
+from datetime import date, timedelta
 from html import escape
 from pathlib import Path
 from urllib.parse import urlencode
@@ -16,6 +17,7 @@ import yfinance as yf
 
 WATCHLIST_DB_PATH = Path(__file__).with_name(".watchlist.db")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
+INDICATOR_LOOKBACK_DAYS = 400
 MOMENTUM_COLOURS = {
     "positive": "#22c55e",
     "negative": "#ef6461",
@@ -29,7 +31,7 @@ METRIC_GRID_STYLES = """
     width: 100%;
 }
 .metric-grid--latest {
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 .metric-grid--fundamentals {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -209,12 +211,25 @@ def readable_exchange_name(exchange: str | None) -> str:
     return EXCHANGE_NAMES.get(cleaned_exchange, cleaned_exchange)
 
 
+def indicator_calculation_start(start_date: str) -> str:
+    """Return an earlier date that supplies enough indicator history."""
+    try:
+        selected_start = pd.Timestamp(start_date)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Enter a valid start date.") from error
+    if pd.isna(selected_start):
+        raise ValueError("Enter a valid start date.")
+    return (
+        selected_start - pd.Timedelta(days=INDICATOR_LOOKBACK_DAYS)
+    ).date().isoformat()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def download_stock_data(ticker: str) -> pd.DataFrame:
-    """Download one ticker's trailing year and cache it for one hour."""
+def download_stock_data(ticker: str, start_date: str) -> pd.DataFrame:
+    """Download through Yahoo's newest row with extra indicator history."""
     data = yf.download(
         ticker,
-        period="1y",
+        start=indicator_calculation_start(start_date),
         interval="1d",
         auto_adjust=False,
         progress=False,
@@ -229,8 +244,71 @@ def download_stock_data(ticker: str) -> pd.DataFrame:
     return data
 
 
+def add_technical_indicators(stock_data: pd.DataFrame) -> pd.DataFrame:
+    """Add close-based 50D/200D averages and Wilder-style 14D RSI."""
+    if "Close" not in stock_data.columns:
+        raise ValueError("Closing-price data is required.")
+
+    enriched_data = stock_data.copy()
+    closing_prices = pd.to_numeric(enriched_data["Close"], errors="coerce")
+    enriched_data["MA_50"] = closing_prices.rolling(
+        window=50,
+        min_periods=50,
+    ).mean()
+    enriched_data["MA_200"] = closing_prices.rolling(
+        window=200,
+        min_periods=200,
+    ).mean()
+
+    close_changes = closing_prices.diff()
+    gains = close_changes.clip(lower=0)
+    losses = -close_changes.clip(upper=0)
+    average_gain = gains.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
+    average_loss = losses.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
+    relative_strength = average_gain / average_loss
+    rsi = 100 - (100 / (1 + relative_strength))
+    rsi = rsi.mask((average_gain == 0) & (average_loss == 0), 50.0)
+    rsi = rsi.mask((average_gain > 0) & (average_loss == 0), 100.0)
+    enriched_data["RSI_14"] = rsi
+    return enriched_data
+
+
+def filter_data_from_start(
+    stock_data: pd.DataFrame,
+    start_date: str,
+) -> pd.DataFrame:
+    """Return rows on or after the user-selected start date."""
+    try:
+        selected_timestamp = pd.Timestamp(start_date)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Enter a valid start date.") from error
+    if pd.isna(selected_timestamp):
+        raise ValueError("Enter a valid start date.")
+    selected_start = selected_timestamp.date()
+
+    available_dates = pd.to_datetime(stock_data.index, errors="coerce")
+    visible_mask = [
+        not pd.isna(value) and value.date() >= selected_start
+        for value in available_dates
+    ]
+    visible_data = stock_data.loc[visible_mask].copy()
+    if visible_data.empty:
+        raise ValueError(
+            "No trading data is available on or after the selected start date."
+        )
+    return visible_data
+
+
 def latest_market_summary(stock_data: pd.DataFrame) -> dict[str, object]:
-    """Return newest OHLCV values and the one-day close return."""
+    """Return newest prices, volume, indicators, and one-day return."""
     if "Close" not in stock_data.columns:
         raise ValueError("Closing-price data is required.")
 
@@ -264,6 +342,9 @@ def latest_market_summary(stock_data: pd.DataFrame) -> dict[str, object]:
         "high": available_number("High"),
         "low": available_number("Low"),
         "volume": available_number("Volume"),
+        "ma_50": available_number("MA_50"),
+        "ma_200": available_number("MA_200"),
+        "rsi": available_number("RSI_14"),
         "return": daily_return,
     }
 
@@ -475,10 +556,14 @@ def fallback_market_details(ticker: str) -> tuple[str, str]:
     return COMMON_MARKETS.get(ticker, ("Market", "MARKET"))
 
 
-def build_close_figure(stock_data: pd.DataFrame):
+def build_close_figure(
+    stock_data: pd.DataFrame,
+    momentum_return: float | None = None,
+):
     """Create a close chart coloured by the newest one-day momentum."""
-    summary = latest_market_summary(stock_data)
-    direction = momentum_direction(summary["return"])
+    if momentum_return is None:
+        momentum_return = latest_market_summary(stock_data)["return"]
+    direction = momentum_direction(momentum_return)
     figure = px.line(
         stock_data,
         x=stock_data.index,
@@ -712,6 +797,29 @@ def render_market_summary(stock_data: pd.DataFrame) -> None:
             ),
             "neutral",
         ),
+        (
+            "Moving Average 50D",
+            (
+                "—"
+                if summary["ma_50"] is None
+                else f"${summary['ma_50']:,.2f}"
+            ),
+            "neutral",
+        ),
+        (
+            "Moving Average 200D",
+            (
+                "—"
+                if summary["ma_200"] is None
+                else f"${summary['ma_200']:,.2f}"
+            ),
+            "neutral",
+        ),
+        (
+            "RSI (14D)",
+            "—" if summary["rsi"] is None else f"{summary['rsi']:,.2f}",
+            "neutral",
+        ),
     ]
     st.markdown(
         build_metric_grid(
@@ -796,6 +904,17 @@ def main() -> None:
         )
     )
 
+    start_date = st.sidebar.date_input(
+        "Start date",
+        value=date.today() - timedelta(days=365),
+        max_value=date.today(),
+        help=(
+            "Choose the first date shown in the chart. The end date always "
+            "uses the newest available Yahoo Finance trading day."
+        ),
+    )
+    st.sidebar.caption("End date: newest available trading day.")
+
     try:
         watchlist = load_watchlist()
         watchlist_storage_available = True
@@ -832,7 +951,13 @@ def main() -> None:
 
     try:
         with st.spinner(f"Downloading {ticker} data..."):
-            stock_data = download_stock_data(ticker)
+            complete_stock_data = add_technical_indicators(
+                download_stock_data(ticker, start_date.isoformat())
+            )
+            stock_data = filter_data_from_start(
+                complete_stock_data,
+                start_date.isoformat(),
+            )
     except ValueError:
         st.title("Financial Market Dashboard")
         st.warning(
@@ -871,14 +996,18 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    figure = build_close_figure(stock_data)
+    latest_summary = latest_market_summary(complete_stock_data)
+    figure = build_close_figure(
+        stock_data,
+        momentum_return=latest_summary["return"],
+    )
     st.plotly_chart(
         figure,
         use_container_width=True,
         config={"displaylogo": False},
     )
 
-    render_market_summary(stock_data)
+    render_market_summary(complete_stock_data)
     render_fundamentals(ticker)
 
     csv_data = stock_data.to_csv().encode("utf-8")
@@ -886,7 +1015,7 @@ def main() -> None:
     st.download_button(
         label="Download current data as CSV",
         data=csv_data,
-        file_name=f"{safe_ticker}_trailing_year.csv",
+        file_name=f"{safe_ticker}_{start_date.isoformat()}_to_latest.csv",
         mime="text/csv",
     )
 

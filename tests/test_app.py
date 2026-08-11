@@ -34,6 +34,16 @@ class CloseFigureTests(unittest.TestCase):
 
         self.assertEqual(figure.data[0].line.color, "#ef6461")
 
+    def test_explicit_latest_return_colours_a_single_visible_point(self) -> None:
+        stock_data = pd.DataFrame(
+            {"Close": [100.0]},
+            index=pd.to_datetime(["2026-08-07"]),
+        )
+
+        figure = app.build_close_figure(stock_data, momentum_return=-1.25)
+
+        self.assertEqual(figure.data[0].line.color, "#ef6461")
+
 
 class WatchlistStorageTests(unittest.TestCase):
     def test_watchlist_preserves_addition_order_and_ignores_duplicates(self) -> None:
@@ -159,7 +169,9 @@ class WatchlistNavigationTests(unittest.TestCase):
 
 
 class MarketSummaryTests(unittest.TestCase):
-    def test_stock_download_uses_fixed_trailing_year(self) -> None:
+    def test_stock_download_includes_indicator_lookback_and_no_fixed_end(
+        self,
+    ) -> None:
         market_data = pd.DataFrame(
             {"Close": [100.0]},
             index=pd.to_datetime(["2026-08-07"]),
@@ -168,12 +180,54 @@ class MarketSummaryTests(unittest.TestCase):
         with patch.object(
             app.yf, "download", return_value=market_data
         ) as download:
-            returned_data = app.download_stock_data("AAPL")
+            returned_data = app.download_stock_data("AAPL", "2026-01-01")
 
         self.assertIs(returned_data, market_data)
-        self.assertEqual(download.call_args.kwargs["period"], "1y")
-        self.assertNotIn("start", download.call_args.kwargs)
+        self.assertEqual(download.call_args.kwargs["start"], "2024-11-27")
+        self.assertNotIn("period", download.call_args.kwargs)
         self.assertNotIn("end", download.call_args.kwargs)
+
+    def test_visible_data_starts_on_selected_date(self) -> None:
+        market_data = pd.DataFrame(
+            {"Close": [98.0, 100.0, 102.0]},
+            index=pd.to_datetime(
+                ["2025-12-31", "2026-01-02", "2026-01-05"]
+            ),
+        )
+
+        visible_data = app.filter_data_from_start(
+            market_data,
+            "2026-01-01",
+        )
+
+        self.assertEqual(
+            list(visible_data.index),
+            list(pd.to_datetime(["2026-01-02", "2026-01-05"])),
+        )
+
+    def test_technical_indicators_use_full_hidden_history(self) -> None:
+        closing_prices = pd.Series(range(1, 221), dtype=float)
+        market_data = pd.DataFrame(
+            {"Close": closing_prices.to_numpy()},
+            index=pd.date_range("2025-01-01", periods=220, freq="D"),
+        )
+
+        enriched_data = app.add_technical_indicators(market_data)
+
+        self.assertAlmostEqual(enriched_data["MA_50"].iloc[-1], 195.5)
+        self.assertAlmostEqual(enriched_data["MA_200"].iloc[-1], 120.5)
+        self.assertAlmostEqual(enriched_data["RSI_14"].iloc[-1], 100.0)
+        self.assertTrue(pd.isna(enriched_data["MA_200"].iloc[198]))
+
+    def test_rsi_is_neutral_when_closing_price_is_flat(self) -> None:
+        market_data = pd.DataFrame(
+            {"Close": [100.0] * 20},
+            index=pd.date_range("2026-01-01", periods=20, freq="D"),
+        )
+
+        enriched_data = app.add_technical_indicators(market_data)
+
+        self.assertEqual(enriched_data["RSI_14"].iloc[-1], 50.0)
 
     def test_latest_market_summary_uses_newest_available_row_and_close(self) -> None:
         market_data = pd.DataFrame(
@@ -183,6 +237,9 @@ class MarketSummaryTests(unittest.TestCase):
                 "Low": [99.0, 104.0, 107.0],
                 "Close": [104.0, None, 110.0],
                 "Volume": [1_000_000, 1_100_000, 1_250_000],
+                "MA_50": [100.0, 101.0, 102.0],
+                "MA_200": [90.0, 91.0, 92.0],
+                "RSI_14": [55.0, 56.0, 57.0],
             },
             index=pd.to_datetime(
                 ["2026-08-06", "2026-08-07", "2026-08-10"]
@@ -196,6 +253,9 @@ class MarketSummaryTests(unittest.TestCase):
         self.assertEqual(summary["high"], 112.0)
         self.assertEqual(summary["low"], 107.0)
         self.assertEqual(summary["volume"], 1_250_000.0)
+        self.assertEqual(summary["ma_50"], 102.0)
+        self.assertEqual(summary["ma_200"], 92.0)
+        self.assertEqual(summary["rsi"], 57.0)
         self.assertAlmostEqual(summary["return"], (110.0 / 104.0 - 1) * 100)
 
     def test_fundamental_metrics_include_only_available_values(self) -> None:
@@ -256,6 +316,55 @@ class MarketSummaryTests(unittest.TestCase):
         self.assertIn("font-size: 1rem", app.METRIC_GRID_STYLES)
         self.assertIn('class="metric-value negative"', metric_html)
         self.assertNotIn("font-size: 2", app.METRIC_GRID_STYLES)
+
+    def test_latest_market_grid_uses_four_columns_for_two_balanced_rows(
+        self,
+    ) -> None:
+        self.assertIn(
+            ".metric-grid--latest {\n    grid-template-columns: repeat(4",
+            app.METRIC_GRID_STYLES,
+        )
+
+    def test_latest_market_grid_displays_moving_averages_and_rsi(self) -> None:
+        market_data = pd.DataFrame(
+            {
+                "Open": [100.0, 101.0],
+                "High": [102.0, 103.0],
+                "Low": [99.0, 100.0],
+                "Close": [101.0, 102.0],
+                "Volume": [1_000, 1_100],
+                "MA_50": [95.0, 96.0],
+                "MA_200": [85.0, 86.0],
+                "RSI_14": [55.0, 56.0],
+            },
+            index=pd.to_datetime(["2026-08-07", "2026-08-10"]),
+        )
+
+        with (
+            patch.object(app, "build_metric_grid", return_value="<grid>") as grid,
+            patch.object(app.st, "subheader"),
+            patch.object(app.st, "caption"),
+            patch.object(app.st, "markdown"),
+        ):
+            app.render_market_summary(market_data)
+
+        metrics = grid.call_args.args[0]
+        self.assertEqual(
+            [label for label, _, _ in metrics],
+            [
+                "Open",
+                "High",
+                "Low",
+                "Return",
+                "Volume",
+                "Moving Average 50D",
+                "Moving Average 200D",
+                "RSI (14D)",
+            ],
+        )
+        self.assertIn(("Moving Average 50D", "$96.00", "neutral"), metrics)
+        self.assertIn(("Moving Average 200D", "$86.00", "neutral"), metrics)
+        self.assertIn(("RSI (14D)", "56.00", "neutral"), metrics)
 
 
 if __name__ == "__main__":
