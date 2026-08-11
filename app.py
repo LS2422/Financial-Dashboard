@@ -474,13 +474,91 @@ def format_fundamental_metrics(
     return metrics
 
 
+def collect_fundamental_info(ticker: str) -> dict[str, object]:
+    """Collect fundamentals with independent fallbacks for Yahoo outages."""
+    instrument = yf.Ticker(ticker)
+    market_info: dict[str, object] = {}
+
+    try:
+        detailed_info = instrument.get_info()
+        if isinstance(detailed_info, Mapping):
+            market_info.update(detailed_info)
+    except Exception:
+        pass
+
+    def numeric_value_missing(key: str) -> bool:
+        return _available_number(market_info.get(key)) is None
+
+    fast_info: dict[str, object] = {}
+    if any(
+        numeric_value_missing(key)
+        for key in ("trailingPE", "marketCap", "sharesOutstanding")
+    ):
+        try:
+            fast_info.update(dict(instrument.get_fast_info()))
+        except Exception:
+            pass
+
+    if numeric_value_missing("marketCap"):
+        market_info["marketCap"] = fast_info.get("marketCap")
+    if numeric_value_missing("sharesOutstanding"):
+        market_info["sharesOutstanding"] = fast_info.get("shares")
+
+    if numeric_value_missing("trailingEps"):
+        try:
+            income_statement = instrument.get_income_stmt(freq="trailing")
+            if isinstance(income_statement, pd.DataFrame):
+                for row_name in ("DilutedEPS", "BasicEPS"):
+                    if row_name not in income_statement.index:
+                        continue
+                    available_eps = pd.to_numeric(
+                        income_statement.loc[row_name],
+                        errors="coerce",
+                    ).dropna()
+                    if not available_eps.empty:
+                        market_info["trailingEps"] = float(
+                            available_eps.iloc[0]
+                        )
+                        break
+        except Exception:
+            pass
+
+    if numeric_value_missing("trailingPE"):
+        latest_price = _available_number(fast_info.get("lastPrice"))
+        trailing_eps = _available_number(market_info.get("trailingEps"))
+        if latest_price is not None and trailing_eps not in {None, 0}:
+            market_info["trailingPE"] = latest_price / trailing_eps
+
+    if numeric_value_missing("dividendRate"):
+        try:
+            dividends = pd.to_numeric(
+                instrument.get_dividends(period="1y"),
+                errors="coerce",
+            ).dropna()
+            if not dividends.empty:
+                market_info["dividendRate"] = float(
+                    dividends.tail(4).sum()
+                )
+        except Exception:
+            pass
+
+    if not _format_market_date(market_info.get("exDividendDate")):
+        try:
+            calendar = instrument.get_calendar()
+            if isinstance(calendar, Mapping):
+                market_info["exDividendDate"] = calendar.get(
+                    "Ex-Dividend Date"
+                )
+        except Exception:
+            pass
+
+    return market_info
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_fundamental_metrics(ticker: str) -> list[tuple[str, str]]:
-    """Fetch and format available company fundamentals for one ticker."""
-    market_info = yf.Ticker(ticker).get_info()
-    if not isinstance(market_info, Mapping):
-        return []
-    return format_fundamental_metrics(market_info)
+    """Fetch and format available company fundamentals with fallbacks."""
+    return format_fundamental_metrics(collect_fundamental_info(ticker))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -832,15 +910,19 @@ def render_market_summary(stock_data: pd.DataFrame) -> None:
 
 
 def render_fundamentals(ticker: str) -> None:
-    """Render company fundamentals only when Yahoo provides them."""
+    """Render company fundamentals or an explicit availability message."""
+    st.subheader("Company Fundamentals")
     try:
         metrics = get_fundamental_metrics(ticker)
     except Exception:
         metrics = []
     if not metrics:
+        st.info(
+            "Company fundamentals are temporarily unavailable from Yahoo "
+            "Finance."
+        )
         return
 
-    st.subheader("Company Fundamentals")
     st.markdown(
         build_metric_grid(
             [

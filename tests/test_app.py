@@ -297,6 +297,59 @@ class MarketSummaryTests(unittest.TestCase):
 
         self.assertEqual(metrics, [("Market Cap", "$2.50M")])
 
+    def test_fundamentals_fall_back_when_detailed_info_fails(self) -> None:
+        class FallbackTicker:
+            def get_info(self):
+                raise RuntimeError("Detailed metadata is unavailable")
+
+            def get_fast_info(self):
+                return {
+                    "lastPrice": 100.0,
+                    "marketCap": 2_500_000_000,
+                    "shares": 25_000_000,
+                }
+
+            def get_income_stmt(self, **_kwargs):
+                return pd.DataFrame(
+                    {pd.Timestamp("2026-06-30"): [5.0]},
+                    index=["DilutedEPS"],
+                )
+
+            def get_dividends(self, **_kwargs):
+                return pd.Series([0.25, 0.25, 0.25, 0.25])
+
+            def get_calendar(self):
+                return {"Ex-Dividend Date": pd.Timestamp("2026-08-10")}
+
+        with patch.object(app.yf, "Ticker", return_value=FallbackTicker()):
+            metrics = app.get_fundamental_metrics("FALLBACK")
+
+        self.assertEqual(
+            metrics,
+            [
+                ("P/E Ratio", "20.00"),
+                ("Dividend", "$1.00"),
+                ("EPS", "$5.00"),
+                ("Ex-Dividend Date", "2026-08-10"),
+                ("Market Cap", "$2.50B"),
+                ("Shares Outstanding", "25.00M"),
+            ],
+        )
+
+    def test_fundamentals_show_a_visible_unavailable_state(self) -> None:
+        with (
+            patch.object(app, "get_fundamental_metrics", return_value=[]),
+            patch.object(app.st, "subheader") as subheader,
+            patch.object(app.st, "info") as info,
+        ):
+            app.render_fundamentals("AAPL")
+
+        subheader.assert_called_once_with("Company Fundamentals")
+        info.assert_called_once_with(
+            "Company fundamentals are temporarily unavailable from Yahoo "
+            "Finance."
+        )
+
     def test_metric_grid_uses_equal_label_and_value_sizes_and_two_columns(
         self,
     ) -> None:
