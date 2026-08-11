@@ -336,6 +336,89 @@ class MarketSummaryTests(unittest.TestCase):
             ],
         )
 
+    def test_dividend_fallback_annualizes_latest_quarterly_payment(self) -> None:
+        class QuarterlyDividendTicker:
+            def get_info(self):
+                raise RuntimeError("Detailed metadata is unavailable")
+
+            def get_fast_info(self):
+                return {}
+
+            def get_income_stmt(self, **_kwargs):
+                return pd.DataFrame()
+
+            def get_dividends(self, **_kwargs):
+                return pd.Series(
+                    [0.235, 0.235, 0.248, 0.248],
+                    index=pd.to_datetime(
+                        [
+                            "2025-08-15",
+                            "2025-12-12",
+                            "2026-03-20",
+                            "2026-05-08",
+                        ]
+                    ),
+                )
+
+            def get_calendar(self):
+                return {"Ex-Dividend Date": pd.Timestamp("2026-08-21")}
+
+        with patch.object(
+            app.yf,
+            "Ticker",
+            return_value=QuarterlyDividendTicker(),
+        ):
+            metrics = app.get_fundamental_metrics("WMT-FALLBACK")
+
+        self.assertIn(("Dividend", "$0.99"), metrics)
+        self.assertNotIn(("Dividend", "$0.97"), metrics)
+
+    def test_dividend_fallback_keeps_nonpayer_dividend_unavailable(self) -> None:
+        dividend_rate = app.estimate_forward_dividend_rate(
+            pd.Series(dtype=float)
+        )
+
+        self.assertIsNone(dividend_rate)
+
+    def test_fundamentals_retry_metadata_using_a_fresh_ticker(self) -> None:
+        class UnavailableTicker:
+            def get_info(self):
+                raise RuntimeError("Temporary Yahoo metadata failure")
+
+            def get_fast_info(self):
+                return {}
+
+            def get_income_stmt(self, **_kwargs):
+                return pd.DataFrame()
+
+            def get_dividends(self, **_kwargs):
+                return pd.Series(dtype=float)
+
+            def get_calendar(self):
+                raise RuntimeError("Temporary Yahoo calendar failure")
+
+        class RecoveredTicker:
+            def get_info(self):
+                return {
+                    "dividendRate": 0.99,
+                    "exDividendDate": 1_787_270_400,
+                }
+
+        with patch.object(
+            app.yf,
+            "Ticker",
+            side_effect=[UnavailableTicker(), RecoveredTicker()],
+        ):
+            metrics = app.get_fundamental_metrics("WMT-RETRY")
+
+        self.assertEqual(
+            metrics,
+            [
+                ("Dividend", "$0.99"),
+                ("Ex-Dividend Date", "2026-08-21"),
+            ],
+        )
+
     def test_fundamentals_show_a_visible_unavailable_state(self) -> None:
         with (
             patch.object(app, "get_fundamental_metrics", return_value=[]),

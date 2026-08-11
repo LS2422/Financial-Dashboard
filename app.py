@@ -18,6 +18,9 @@ import yfinance as yf
 WATCHLIST_DB_PATH = Path(__file__).with_name(".watchlist.db")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
 INDICATOR_LOOKBACK_DAYS = 400
+FUNDAMENTALS_CACHE_SECONDS = 900
+YAHOO_NETWORK_RETRIES = 2
+yf.config.network.retries = YAHOO_NETWORK_RETRIES
 MOMENTUM_COLOURS = {
     "positive": "#22c55e",
     "negative": "#ef6461",
@@ -504,17 +507,68 @@ def format_fundamental_metrics(
     return metrics
 
 
+def estimate_forward_dividend_rate(dividends: pd.Series) -> float | None:
+    """Estimate an annual rate from the latest recurring dividend payment."""
+    if not isinstance(dividends, pd.Series) or dividends.empty:
+        return None
+
+    available_dividends = pd.to_numeric(
+        dividends,
+        errors="coerce",
+    ).dropna()
+    available_dividends = available_dividends[available_dividends > 0]
+    if available_dividends.empty:
+        return None
+
+    payment_frequency = None
+    valid_dates = pd.Series(dtype="datetime64[ns, UTC]")
+    if isinstance(available_dividends.index, pd.DatetimeIndex):
+        payment_dates = pd.to_datetime(
+            available_dividends.index,
+            errors="coerce",
+            utc=True,
+        )
+        valid_dates = pd.Series(payment_dates).dropna().sort_values()
+    if len(valid_dates) >= 2:
+        payment_gaps = valid_dates.diff().dt.days.dropna()
+        if not payment_gaps.empty:
+            median_gap = float(payment_gaps.tail(12).median())
+            if median_gap <= 45:
+                payment_frequency = 12
+            elif median_gap <= 150:
+                payment_frequency = 4
+            elif median_gap <= 250:
+                payment_frequency = 2
+            else:
+                payment_frequency = 1
+
+    if payment_frequency is None:
+        return float(available_dividends.tail(4).sum())
+    return float(available_dividends.iloc[-1]) * payment_frequency
+
+
 def collect_fundamental_info(ticker: str) -> dict[str, object]:
     """Collect fundamentals with independent fallbacks for Yahoo outages."""
     instrument = yf.Ticker(ticker)
     market_info: dict[str, object] = {}
+    detailed_info_loaded = False
 
     try:
         detailed_info = instrument.get_info()
         if isinstance(detailed_info, Mapping):
             market_info.update(detailed_info)
+            detailed_info_loaded = bool(detailed_info)
     except Exception:
         pass
+
+    if not detailed_info_loaded:
+        try:
+            instrument = yf.Ticker(ticker)
+            detailed_info = instrument.get_info()
+            if isinstance(detailed_info, Mapping):
+                market_info.update(detailed_info)
+        except Exception:
+            pass
 
     def numeric_value_missing(key: str) -> bool:
         return _available_number(market_info.get(key)) is None
@@ -561,14 +615,11 @@ def collect_fundamental_info(ticker: str) -> dict[str, object]:
 
     if numeric_value_missing("dividendRate"):
         try:
-            dividends = pd.to_numeric(
-                instrument.get_dividends(period="1y"),
-                errors="coerce",
-            ).dropna()
-            if not dividends.empty:
-                market_info["dividendRate"] = float(
-                    dividends.tail(4).sum()
-                )
+            dividend_rate = estimate_forward_dividend_rate(
+                instrument.get_dividends(period="1y")
+            )
+            if dividend_rate is not None:
+                market_info["dividendRate"] = dividend_rate
         except Exception:
             pass
 
@@ -585,7 +636,7 @@ def collect_fundamental_info(ticker: str) -> dict[str, object]:
     return market_info
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=FUNDAMENTALS_CACHE_SECONDS, show_spinner=False)
 def get_fundamental_metrics(ticker: str) -> list[tuple[str, str]]:
     """Fetch and format available company fundamentals with fallbacks."""
     return format_fundamental_metrics(collect_fundamental_info(ticker))
