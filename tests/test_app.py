@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -43,6 +43,99 @@ class CloseFigureTests(unittest.TestCase):
         figure = app.build_close_figure(stock_data, momentum_return=-1.25)
 
         self.assertEqual(figure.data[0].line.color, "#ef6461")
+
+    def test_optional_overlays_are_hidden_by_default(self) -> None:
+        stock_data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.5],
+                "Volume": [1_000_000, 1_250_000],
+                "MA_50": [98.0, 98.5],
+                "MA_200": [90.0, 90.2],
+            },
+            index=pd.to_datetime(["2026-08-06", "2026-08-07"]),
+        )
+
+        figure = app.build_close_figure(stock_data)
+
+        self.assertEqual([trace.name for trace in figure.data], ["Close"])
+        self.assertNotIn("yaxis2", figure.layout)
+
+    def test_volume_overlay_adds_translucent_bars_on_secondary_axis(self) -> None:
+        stock_data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.5],
+                "Volume": [1_000_000, 1_250_000],
+            },
+            index=pd.to_datetime(["2026-08-06", "2026-08-07"]),
+        )
+
+        figure = app.build_close_figure(stock_data, show_volume=True)
+
+        self.assertEqual(
+            [trace.name for trace in figure.data],
+            ["Close", "Volume"],
+        )
+        self.assertEqual(figure.data[1].type, "bar")
+        self.assertEqual(figure.data[1].yaxis, "y2")
+        self.assertLess(figure.data[1].opacity, 1)
+        self.assertEqual(figure.layout.yaxis2.title.text, "Volume")
+        self.assertEqual(figure.layout.yaxis2.overlaying, "y")
+        self.assertEqual(figure.layout.yaxis2.side, "right")
+
+    def test_moving_average_overlay_adds_50d_and_200d_lines(self) -> None:
+        stock_data = pd.DataFrame(
+            {
+                "Close": [100.0, 101.5],
+                "MA_50": [98.0, 98.5],
+                "MA_200": [90.0, 90.2],
+            },
+            index=pd.to_datetime(["2026-08-06", "2026-08-07"]),
+        )
+
+        figure = app.build_close_figure(
+            stock_data,
+            show_moving_averages=True,
+        )
+
+        self.assertEqual(
+            [trace.name for trace in figure.data],
+            ["Close", "50D Moving Average", "200D Moving Average"],
+        )
+        self.assertTrue(all(trace.mode == "lines" for trace in figure.data))
+        self.assertNotEqual(
+            figure.data[1].line.dash,
+            figure.data[2].line.dash,
+        )
+        self.assertTrue(figure.layout.showlegend)
+
+    def test_overlay_controls_are_independent_and_off_by_default(self) -> None:
+        columns = [MagicMock(), MagicMock()]
+        with (
+            patch.object(app.st, "columns", return_value=columns),
+            patch.object(app.st, "caption") as caption,
+            patch.object(
+                app.st,
+                "toggle",
+                side_effect=[False, False],
+            ) as toggle,
+        ):
+            show_volume, show_moving_averages = (
+                app.render_chart_overlay_controls()
+            )
+
+        self.assertFalse(show_volume)
+        self.assertFalse(show_moving_averages)
+        caption.assert_called_once_with("Chart overlays")
+        self.assertEqual(
+            [call.args[0] for call in toggle.call_args_list],
+            ["Volume", "Moving averages"],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["value"] is False
+                for call in toggle.call_args_list
+            )
+        )
 
 
 class WatchlistStorageTests(unittest.TestCase):

@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
 import pandas as pd
-import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
@@ -715,30 +715,124 @@ def fallback_market_details(ticker: str) -> tuple[str, str]:
     return COMMON_MARKETS.get(ticker, ("Market", "MARKET"))
 
 
+def render_chart_overlay_controls() -> tuple[bool, bool]:
+    """Render independent controls for optional market-chart overlays."""
+    st.caption("Chart overlays")
+    volume_column, averages_column = st.columns(2, gap="small")
+    with volume_column:
+        show_volume = st.toggle(
+            "Volume",
+            value=False,
+            key="show_volume_overlay",
+            help="Overlay daily trading volume as translucent bars.",
+        )
+    with averages_column:
+        show_moving_averages = st.toggle(
+            "Moving averages",
+            value=False,
+            key="show_moving_average_overlay",
+            help="Overlay the 50-day and 200-day moving averages.",
+        )
+    return show_volume, show_moving_averages
+
+
 def build_close_figure(
     stock_data: pd.DataFrame,
     momentum_return: float | None = None,
+    show_volume: bool = False,
+    show_moving_averages: bool = False,
 ):
-    """Create a close chart coloured by the newest one-day momentum."""
+    """Create the close chart with optional volume and average overlays."""
     if momentum_return is None:
         momentum_return = latest_market_summary(stock_data)["return"]
     direction = momentum_direction(momentum_return)
-    figure = px.line(
-        stock_data,
-        x=stock_data.index,
-        y="Close",
-        markers=False,
-        labels={"Date": "Date", "Close": "Closing value (USD)"},
+    has_volume_overlay = show_volume and "Volume" in stock_data.columns
+    has_moving_average_overlay = show_moving_averages and any(
+        column in stock_data.columns for column in ("MA_50", "MA_200")
     )
-    figure.update_traces(
-        line={"color": MOMENTUM_COLOURS[direction], "width": 2.5},
-        hovertemplate=(
-            "Date: %{x|%Y-%m-%d}<br>"
-            "Close: %{y:,.2f} USD"
-            "<extra></extra>"
-        ),
+    figure = go.Figure()
+    figure.add_trace(
+        go.Scatter(
+            x=stock_data.index,
+            y=stock_data["Close"],
+            name="Close",
+            mode="lines",
+            line={"color": MOMENTUM_COLOURS[direction], "width": 2.5},
+            hovertemplate=(
+                "Date: %{x|%Y-%m-%d}<br>"
+                "Close: %{y:,.2f} USD"
+                "<extra></extra>"
+            ),
+        )
     )
-    figure.update_layout(hovermode="closest", showlegend=False)
+
+    if has_volume_overlay:
+        figure.add_trace(
+            go.Bar(
+                x=stock_data.index,
+                y=stock_data["Volume"],
+                name="Volume",
+                marker={"color": "#8b919d", "line": {"width": 0}},
+                opacity=0.24,
+                yaxis="y2",
+                hovertemplate=(
+                    "Date: %{x|%Y-%m-%d}<br>"
+                    "Volume: %{y:,.0f}"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    if show_moving_averages:
+        moving_average_styles = (
+            ("MA_50", "50D Moving Average", "#f59e0b", "solid"),
+            ("MA_200", "200D Moving Average", "#3b82f6", "dash"),
+        )
+        for column, name, colour, dash_style in moving_average_styles:
+            if column not in stock_data.columns:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=stock_data.index,
+                    y=stock_data[column],
+                    name=name,
+                    mode="lines",
+                    line={
+                        "color": colour,
+                        "width": 1.8,
+                        "dash": dash_style,
+                    },
+                    hovertemplate=(
+                        "Date: %{x|%Y-%m-%d}<br>"
+                        f"{name}: "
+                        "%{y:,.2f} USD"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+    layout_updates = {
+        "hovermode": "closest",
+        "showlegend": has_volume_overlay or has_moving_average_overlay,
+        "barmode": "overlay",
+        "xaxis": {"title": "Date"},
+        "yaxis": {"title": "Closing value (USD)"},
+        "legend": {
+            "orientation": "h",
+            "x": 0,
+            "y": 1.02,
+            "yanchor": "bottom",
+        },
+    }
+    if has_volume_overlay:
+        layout_updates["yaxis2"] = {
+            "title": "Volume",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "rangemode": "tozero",
+        }
+    figure.update_layout(**layout_updates)
     return figure
 
 
@@ -1343,9 +1437,12 @@ def main() -> None:
     )
 
     latest_summary = latest_market_summary(complete_stock_data)
+    show_volume, show_moving_averages = render_chart_overlay_controls()
     figure = build_close_figure(
         stock_data,
         momentum_return=latest_summary["return"],
+        show_volume=show_volume,
+        show_moving_averages=show_moving_averages,
     )
     st.plotly_chart(
         figure,
