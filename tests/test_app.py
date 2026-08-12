@@ -108,6 +108,40 @@ class CloseFigureTests(unittest.TestCase):
         )
         self.assertTrue(figure.layout.showlegend)
 
+    def test_trading_dates_share_even_positions_without_closed_market_days(
+        self,
+    ) -> None:
+        stock_data = pd.DataFrame(
+            {
+                "Close": [231.41, 229.72],
+                "Volume": [39_445_500, 44_018_200],
+                "MA_50": [224.10, 224.35],
+                "MA_200": [211.60, 211.82],
+            },
+            # The missing dates are a weekend and the US Labor Day holiday.
+            index=pd.to_datetime(["2025-08-29", "2025-09-02"]),
+        )
+
+        figure = app.MarketTrendChart(
+            stock_data,
+            show_volume=True,
+            show_moving_averages=True,
+        ).build()
+
+        expected_dates = ["2025-08-29", "2025-09-02"]
+        self.assertTrue(
+            all(list(trace.x) == expected_dates for trace in figure.data)
+        )
+        self.assertEqual(figure.layout.xaxis.type, "category")
+        self.assertEqual(
+            list(figure.layout.xaxis.categoryarray),
+            expected_dates,
+        )
+        self.assertEqual(figure.layout.xaxis.nticks, 12)
+        self.assertNotIn("2025-08-30", figure.layout.xaxis.categoryarray)
+        self.assertNotIn("2025-08-31", figure.layout.xaxis.categoryarray)
+        self.assertNotIn("2025-09-01", figure.layout.xaxis.categoryarray)
+
     def test_overlay_controls_are_independent_and_off_by_default(self) -> None:
         columns = [MagicMock(), MagicMock()]
         with (

@@ -736,65 +736,88 @@ def render_chart_overlay_controls() -> tuple[bool, bool]:
     return show_volume, show_moving_averages
 
 
-def build_close_figure(
-    stock_data: pd.DataFrame,
-    momentum_return: float | None = None,
-    show_volume: bool = False,
-    show_moving_averages: bool = False,
-):
-    """Create the close chart with optional volume and average overlays."""
-    if momentum_return is None:
-        momentum_return = latest_market_summary(stock_data)["return"]
-    direction = momentum_direction(momentum_return)
-    has_volume_overlay = show_volume and "Volume" in stock_data.columns
-    has_moving_average_overlay = show_moving_averages and any(
-        column in stock_data.columns for column in ("MA_50", "MA_200")
-    )
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=stock_data.index,
-            y=stock_data["Close"],
-            name="Close",
-            mode="lines",
-            line={"color": MOMENTUM_COLOURS[direction], "width": 2.5},
-            hovertemplate=(
-                "Date: %{x|%Y-%m-%d}<br>"
-                "Close: %{y:,.2f} USD"
-                "<extra></extra>"
-            ),
-        )
+class MarketTrendChart:
+    """Build the market trend chart one clear layer at a time."""
+
+    MOVING_AVERAGE_STYLES = (
+        ("MA_50", "50D Moving Average", "#f59e0b", "solid"),
+        ("MA_200", "200D Moving Average", "#3b82f6", "dash"),
     )
 
-    if has_volume_overlay:
-        figure.add_trace(
+    def __init__(
+        self,
+        stock_data: pd.DataFrame,
+        momentum_return: float | None = None,
+        show_volume: bool = False,
+        show_moving_averages: bool = False,
+    ) -> None:
+        self.stock_data = stock_data
+        self.show_volume = show_volume
+        self.show_moving_averages = show_moving_averages
+        self.momentum_return = momentum_return
+        self.trading_dates = self._format_trading_dates()
+        self.figure = go.Figure()
+
+    def _format_trading_dates(self) -> list[str]:
+        """Use only Yahoo's observed trading dates as x-axis positions."""
+        dates = pd.to_datetime(self.stock_data.index)
+        return dates.strftime("%Y-%m-%d").tolist()
+
+    def _line_colour(self) -> str:
+        """Match the close line to the latest daily return."""
+        latest_return = self.momentum_return
+        if latest_return is None:
+            latest_return = latest_market_summary(self.stock_data)["return"]
+        return MOMENTUM_COLOURS[momentum_direction(latest_return)]
+
+    def add_close_line(self) -> None:
+        """Add the main close-price line."""
+        self.figure.add_trace(
+            go.Scatter(
+                x=self.trading_dates,
+                y=self.stock_data["Close"],
+                name="Close",
+                mode="lines",
+                line={"color": self._line_colour(), "width": 2.5},
+                hovertemplate=(
+                    "Date: %{x}<br>"
+                    "Close: %{y:,.2f} USD"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    def add_volume_bars(self) -> None:
+        """Add volume bars when the user turns the overlay on."""
+        if not self.has_volume_overlay:
+            return
+        self.figure.add_trace(
             go.Bar(
-                x=stock_data.index,
-                y=stock_data["Volume"],
+                x=self.trading_dates,
+                y=self.stock_data["Volume"],
                 name="Volume",
                 marker={"color": "#8b919d", "line": {"width": 0}},
                 opacity=0.24,
                 yaxis="y2",
                 hovertemplate=(
-                    "Date: %{x|%Y-%m-%d}<br>"
+                    "Date: %{x}<br>"
                     "Volume: %{y:,.0f}"
                     "<extra></extra>"
                 ),
             )
         )
 
-    if show_moving_averages:
-        moving_average_styles = (
-            ("MA_50", "50D Moving Average", "#f59e0b", "solid"),
-            ("MA_200", "200D Moving Average", "#3b82f6", "dash"),
-        )
-        for column, name, colour, dash_style in moving_average_styles:
-            if column not in stock_data.columns:
+    def add_moving_average_lines(self) -> None:
+        """Add each available moving average when requested."""
+        if not self.show_moving_averages:
+            return
+        for column, name, colour, dash_style in self.MOVING_AVERAGE_STYLES:
+            if column not in self.stock_data.columns:
                 continue
-            figure.add_trace(
+            self.figure.add_trace(
                 go.Scatter(
-                    x=stock_data.index,
-                    y=stock_data[column],
+                    x=self.trading_dates,
+                    y=self.stock_data[column],
                     name=name,
                     mode="lines",
                     line={
@@ -803,7 +826,7 @@ def build_close_figure(
                         "dash": dash_style,
                     },
                     hovertemplate=(
-                        "Date: %{x|%Y-%m-%d}<br>"
+                        "Date: %{x}<br>"
                         f"{name}: "
                         "%{y:,.2f} USD"
                         "<extra></extra>"
@@ -811,29 +834,75 @@ def build_close_figure(
                 )
             )
 
-    layout_updates = {
-        "hovermode": "closest",
-        "showlegend": has_volume_overlay or has_moving_average_overlay,
-        "barmode": "overlay",
-        "xaxis": {"title": "Date"},
-        "yaxis": {"title": "Closing value (USD)"},
-        "legend": {
-            "orientation": "h",
-            "x": 0,
-            "y": 1.02,
-            "yanchor": "bottom",
-        },
-    }
-    if has_volume_overlay:
-        layout_updates["yaxis2"] = {
-            "title": "Volume",
-            "overlaying": "y",
-            "side": "right",
-            "showgrid": False,
-            "rangemode": "tozero",
+    @property
+    def has_volume_overlay(self) -> bool:
+        """Return whether usable volume data should be displayed."""
+        return self.show_volume and "Volume" in self.stock_data.columns
+
+    @property
+    def has_moving_average_overlay(self) -> bool:
+        """Return whether at least one requested average is available."""
+        return self.show_moving_averages and any(
+            column in self.stock_data.columns
+            for column in ("MA_50", "MA_200")
+        )
+
+    def configure_layout(self) -> None:
+        """Configure axes after all selected chart layers are present."""
+        layout_updates = {
+            "hovermode": "closest",
+            "showlegend": (
+                self.has_volume_overlay
+                or self.has_moving_average_overlay
+            ),
+            "barmode": "overlay",
+            "xaxis": {
+                "title": "Trading date",
+                "type": "category",
+                "categoryorder": "array",
+                "categoryarray": self.trading_dates,
+                "nticks": 12,
+            },
+            "yaxis": {"title": "Closing value (USD)"},
+            "legend": {
+                "orientation": "h",
+                "x": 0,
+                "y": 1.02,
+                "yanchor": "bottom",
+            },
         }
-    figure.update_layout(**layout_updates)
-    return figure
+        if self.has_volume_overlay:
+            layout_updates["yaxis2"] = {
+                "title": "Volume",
+                "overlaying": "y",
+                "side": "right",
+                "showgrid": False,
+                "rangemode": "tozero",
+            }
+        self.figure.update_layout(**layout_updates)
+
+    def build(self) -> go.Figure:
+        """Run the chart-building pipeline and return the finished figure."""
+        self.add_close_line()
+        self.add_volume_bars()
+        self.add_moving_average_lines()
+        self.configure_layout()
+        return self.figure
+
+
+def build_close_figure(
+    stock_data: pd.DataFrame,
+    momentum_return: float | None = None,
+    show_volume: bool = False,
+    show_moving_averages: bool = False,
+) -> go.Figure:
+    """Create a market trend chart through the chart-building pipeline."""
+    return MarketTrendChart(
+        stock_data,
+        momentum_return=momentum_return,
+        show_volume=show_volume,
+        show_moving_averages=show_moving_averages,
+    ).build()
 
 
 def build_watchlist_table(
