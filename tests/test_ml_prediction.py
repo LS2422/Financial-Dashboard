@@ -1,6 +1,7 @@
 import math
 import unittest
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -204,6 +205,20 @@ class PackagedArtifactTests(unittest.TestCase):
         self.assertEqual(
             int(unseen_evaluation["Observations"].sum()),
             bundle.metadata.unseen_ticker_summary["observations"],
+        )
+
+
+class RuntimeDependencyTests(unittest.TestCase):
+    def test_requirements_install_sklearn_for_xgboost_regressor(self) -> None:
+        requirements_path = Path(__file__).parents[1] / "requirements.txt"
+        requirements = requirements_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertTrue(
+            any(
+                requirement.strip().lower().startswith("scikit-learn")
+                for requirement in requirements
+            ),
+            "XGBRegressor requires scikit-learn in a clean deployment.",
         )
 
 
