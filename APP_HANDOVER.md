@@ -15,6 +15,8 @@ The dashboard currently provides:
 - A persistent local watchlist.
 - CSV download of the currently displayed market data.
 - An experimental next-trading-session log-return forecast for stocks.
+- Structured JSON logging for Yahoo, watchlist, and ML failures.
+- A reusable market-data interface with Yahoo Finance as the default provider.
 
 The ML feature predicts a return directly. The displayed next adjusted close is reconstructed from that predicted return and is not the model's fitted target.
 
@@ -53,6 +55,22 @@ Later development added:
 - Safe normalization and rendering of the latest Yahoo Finance news.
 - CSV export for the selected visible date range.
 
+### Market-data boundary and operational logging
+
+Yahoo Finance access was later moved behind a `MarketDataSource` protocol. The
+dashboard and ML presentation no longer call `yfinance` directly. The default
+`YahooFinanceDataSource` implementation owns Yahoo-specific download options,
+quote lookup, metadata fallbacks, fundamentals, and news retrieval. This keeps
+the rest of the application independent of one provider and gives future data
+sources the same small interface to implement.
+
+Structured logging was added at the same boundary and at handled application
+failures. Each Streamlit rerun receives a request ID. Log entries are emitted as
+JSON with a stable event name and small diagnostic fields such as the ticker,
+operation, row count, and error type. The existing friendly Streamlit warnings
+remain unchanged; the underlying traceback is written to the application log
+for debugging.
+
 ### Final ML addition
 
 The final development stage added a ticker-agnostic XGBoost deployment workflow based on the Task 5–7 stock-data project. This work introduced:
@@ -69,8 +87,9 @@ The final development stage added a ticker-agnostic XGBoost deployment workflow 
 ```mermaid
 flowchart TD
     A["User enters ticker and start date"] --> B["Validate and normalize symbol"]
-    B --> C["Download Yahoo Finance history"]
-    C --> D["Calculate chart indicators"]
+    B --> C["Request history through MarketDataSource"]
+    C --> C1["YahooFinanceDataSource adapts Yahoo responses"]
+    C1 --> D["Calculate chart indicators"]
     D --> E["Render chart and latest market data"]
     E --> F["Render fundamentals, news, and CSV download"]
     E --> G{"User clicks Predict next trading day?"}
@@ -94,16 +113,75 @@ The prediction history is intentionally independent of the chart's selected star
 | File or directory | Responsibility |
 |---|---|
 | `app.py` | Main Streamlit orchestration, market-data download, indicators, chart, watchlist, fundamentals, news, and CSV download. |
+| `app_logging.py` | JSON log output, one request ID per Streamlit rerun, and stable structured events. |
+| `market_data.py` | The reusable `MarketDataSource` protocol and Yahoo history, quote type, identity, fundamentals, and news implementation. |
 | `ml_prediction.py` | ML feature contract, feature engineering, return metrics, frozen-window evaluation, price reconstruction, forecast generation, staleness checks, and artifact validation. |
 | `ml_prediction_ui.py` | On-demand Yahoo prediction history, stock eligibility checks, cached model loading, and Streamlit presentation of ML outputs and warnings. |
 | `model_artifacts/` | Evaluation model, production model, metadata, training universe, and leave-one-ticker-out results. These files form one versioned deployment unit. |
 | `tests/test_app.py` | Existing chart, watchlist, market-summary, fundamentals, indicator, news, and download behavior. |
 | `tests/test_ml_prediction.py` | Feature formulas, return metrics, price reconstruction, fixed-window behavior, scope labels, staleness, and artifact consistency. |
 | `tests/test_ml_app.py` | Prediction data loading, equity eligibility, lazy loading, UI labels, warnings, and insufficient-history behavior. |
+| `tests/test_market_data.py` | Provider compatibility, Yahoo request normalization, quote-type fallback, and fundamentals fallback behavior. |
+| `tests/test_app_logging.py` | JSON structure, request IDs, handler configuration, and handled dashboard/ML failure logging. |
 | `stock_data_project/Task 6/` | Task 5 data download and Task 6 cleaning/feature-engineering notebooks and outputs. |
 | `stock_data_project/Task 7/` | Research comparison, unique-date tuning, unseen-ticker assessment, production fitting, and artifact-export workflow. |
 
 `stock_data_project/` is intentionally excluded by the current `.gitignore`. Its notebooks and generated research outputs exist locally but are not part of the dashboard Git commits unless that policy is changed deliberately.
+
+### Market-data interface
+
+`MarketDataSource` is a Python `Protocol`. It is an interface rather than a
+base class, so an alternative provider does not need to inherit from the Yahoo
+implementation. It only needs to provide these methods:
+
+```python
+history(ticker, *, start_date=None, period=None)
+quote_type(ticker)
+market_details(ticker)
+fundamentals(ticker)
+news(ticker, *, count=12)
+```
+
+`YahooFinanceDataSource` is the current implementation. It validates ticker
+symbols at the boundary, normalizes them once, converts Yahoo results to stable
+return types, and records provider failures before using the existing
+fallbacks. `app.py` and `ml_prediction_ui.py` depend on the protocol and use the
+shared default source. A future source can therefore be introduced by creating
+another class that satisfies the protocol and changing the default source in
+`market_data.py`; chart, watchlist, and ML calculation code do not need to be
+rewritten.
+
+### Logging and debugging
+
+`app_logging.py` uses only Python's standard `logging` library, so no extra
+runtime dependency is required. Log records are written to standard error,
+which is collected by Streamlit Community Cloud and most other hosting
+platforms.
+
+A typical entry is one JSON object:
+
+```json
+{
+  "event": "yahoo_history_failed",
+  "level": "ERROR",
+  "operation": "history",
+  "request_id": "d6d2...",
+  "ticker": "AAPL"
+}
+```
+
+The traceback is included for exceptions. Price histories, model inputs,
+credentials, tokens, and complete Yahoo payloads are not logged. To investigate
+one failed dashboard rerun, filter the host logs by `request_id`. Common events
+include:
+
+- `yahoo_history_failed`
+- `yahoo_fundamentals_fallback`
+- `watchlist_load_failed`, `watchlist_add_failed`, and
+  `watchlist_remove_failed`
+- `market_history_unavailable` and `market_details_fallback_used`
+- `ml_quote_type_unavailable`, `ml_forecast_unavailable`, and
+  `ml_forecast_failed`
 
 ## 5. What `app.py` Does
 
@@ -303,8 +381,8 @@ python -m unittest discover -s tests -v
 Run static checks when Ruff is available:
 
 ```bash
-ruff check app.py ml_prediction.py ml_prediction_ui.py tests
-python -m compileall -q app.py ml_prediction.py ml_prediction_ui.py tests
+ruff check app.py app_logging.py market_data.py ml_prediction.py ml_prediction_ui.py tests
+python -m compileall -q app.py app_logging.py market_data.py ml_prediction.py ml_prediction_ui.py tests
 ```
 
 In the development environment used for this handover, the Anaconda interpreter at `/Users/yiyangshen/opt/anaconda3/bin/python` contains the required dashboard packages. The system `python3` may not contain Plotly or the other project dependencies.
@@ -314,6 +392,9 @@ In the development environment used for this handover, the Anaconda interpreter 
 ### Updating the dashboard
 
 - Keep general market-dashboard behavior in `app.py`.
+- Keep provider-independent ticker and market-data contracts in `market_data.py`.
+- Keep Yahoo-specific calls and response fallbacks inside `YahooFinanceDataSource`.
+- Use `log_event()` for handled operational failures instead of silently discarding exceptions.
 - Keep model calculations and artifact validation in `ml_prediction.py`.
 - Keep Streamlit and Yahoo-specific ML presentation in `ml_prediction_ui.py`.
 - Preserve the existing dashboard sections and their graceful fallback behavior when adding new features.
@@ -344,6 +425,6 @@ Newer data should be handled as a separately labelled live-monitoring system. A 
 
 ## 12. Final Handover Summary
 
-`app.py` is now a full financial-market exploration dashboard with resilient Yahoo data handling, interactive Plotly visualisation, local watchlist management, current market context, fundamentals, news, and data export. The ML addition is deliberately modular: `app.py` invokes it, `ml_prediction_ui.py` manages the on-demand user experience, and `ml_prediction.py` owns the mathematical and artifact contracts.
+`app.py` is now a full financial-market exploration dashboard with resilient Yahoo data handling, interactive Plotly visualisation, local watchlist management, current market context, fundamentals, news, and data export. External market access is isolated behind `MarketDataSource`, and handled failures produce correlated JSON logs without changing the user-facing fallback behavior. The ML addition remains modular: `app.py` invokes it, `ml_prediction_ui.py` manages the on-demand user experience, and `ml_prediction.py` owns the mathematical and artifact contracts.
 
 The most important maintenance principle is to keep forecasting and evaluation separate. The production model may use the latest labelled training data, but displayed RMSE and R² must continue to come from the evaluation model and the immutable frozen test window. The current weak results and baseline comparisons should remain visible so future users are not given overstated confidence in the forecast.
