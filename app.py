@@ -14,6 +14,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+from ml_prediction_ui import render_ml_prediction
+
 
 WATCHLIST_DB_PATH = Path(__file__).with_name(".watchlist.db")
 TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
@@ -1520,6 +1522,7 @@ def main() -> None:
     )
 
     render_market_summary(complete_stock_data)
+    render_ml_prediction(ticker)
     render_fundamentals(ticker)
     render_latest_news(ticker)
 

@@ -349,7 +349,15 @@ def load_model_bundle(
     metadata_path = artifact_directory / "metadata.json"
     evaluation_path = artifact_directory / "xgb_next_log_return_evaluation.json"
     production_path = artifact_directory / "xgb_next_log_return_production.json"
-    for path in (metadata_path, evaluation_path, production_path):
+    universe_path = artifact_directory / "training_universe.csv"
+    unseen_evaluation_path = artifact_directory / "unseen_ticker_evaluation.csv"
+    for path in (
+        metadata_path,
+        evaluation_path,
+        production_path,
+        universe_path,
+        unseen_evaluation_path,
+    ):
         if not path.is_file():
             raise FileNotFoundError(f"ML artifact is missing: {path}")
 
@@ -369,6 +377,23 @@ def load_model_bundle(
         <= pd.Timestamp(metadata.data_end_date)
     ):
         raise ValueError("ML artifact date boundaries are invalid.")
+
+    training_universe = pd.read_csv(universe_path)
+    unseen_evaluation = pd.read_csv(unseen_evaluation_path)
+    if "Ticker" not in training_universe or "Held-out Ticker" not in unseen_evaluation:
+        raise ValueError("ML artifact ticker summaries are invalid.")
+    expected_tickers = set(metadata.training_tickers)
+    if set(training_universe["Ticker"]) != expected_tickers:
+        raise ValueError("Training-universe artifact does not match metadata.")
+    if set(unseen_evaluation["Held-out Ticker"]) != expected_tickers:
+        raise ValueError("Unseen-ticker artifact does not cover the full universe.")
+    expected_observations = metadata.unseen_ticker_summary.get("observations")
+    if (
+        expected_observations is not None
+        and int(unseen_evaluation["Observations"].sum())
+        != int(expected_observations)
+    ):
+        raise ValueError("Unseen-ticker artifact observation count is invalid.")
 
     import xgboost
     from xgboost import XGBRegressor

@@ -187,5 +187,25 @@ class CurrentForecastTests(unittest.TestCase):
         )
 
 
+class PackagedArtifactTests(unittest.TestCase):
+    def test_bundle_and_leave_one_out_evidence_share_one_contract(self) -> None:
+        bundle = ml_prediction.load_model_bundle()
+        unseen_evaluation = pd.read_csv(
+            ml_prediction.DEFAULT_ARTIFACT_DIRECTORY
+            / "unseen_ticker_evaluation.csv"
+        )
+
+        self.assertEqual(len(bundle.metadata.training_tickers), 18)
+        self.assertEqual(len(unseen_evaluation), 18)
+        self.assertEqual(
+            set(unseen_evaluation["Held-out Ticker"]),
+            set(bundle.metadata.training_tickers),
+        )
+        self.assertEqual(
+            int(unseen_evaluation["Observations"].sum()),
+            bundle.metadata.unseen_ticker_summary["observations"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
