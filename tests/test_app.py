@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 import app
+from market_data import YahooFinanceDataSource
 
 
 class CloseFigureTests(unittest.TestCase):
@@ -240,13 +241,19 @@ class WatchlistPriceTests(unittest.TestCase):
             index=pd.to_datetime(["2026-08-07", "2026-08-10"]),
         )
 
-        with patch.object(app.yf, "download", return_value=market_data):
+        app.download_watchlist_snapshot.clear()
+        with patch.object(
+            app.MARKET_DATA_SOURCE,
+            "history",
+            return_value=market_data,
+        ) as history:
             current_price, percentage_change = app.download_watchlist_snapshot(
                 "AAPL"
             )
 
         self.assertEqual(current_price, 204.0)
         self.assertAlmostEqual(percentage_change, 2.0)
+        history.assert_called_once_with("AAPL", period="5d")
 
 
 class WatchlistDisplayTests(unittest.TestCase):
@@ -296,6 +303,26 @@ class WatchlistNavigationTests(unittest.TestCase):
 
 
 class MarketSummaryTests(unittest.TestCase):
+    def test_stock_download_uses_the_configured_market_data_source(self) -> None:
+        market_data = pd.DataFrame(
+            {"Close": [100.0]},
+            index=pd.to_datetime(["2026-08-07"]),
+        )
+        app.download_stock_data.clear()
+
+        with patch.object(
+            app.MARKET_DATA_SOURCE,
+            "history",
+            return_value=market_data,
+        ) as history:
+            returned_data = app.download_stock_data("AAPL", "2026-01-01")
+
+        self.assertIs(returned_data, market_data)
+        history.assert_called_once_with(
+            "AAPL",
+            start_date="2024-11-27",
+        )
+
     def test_stock_download_includes_indicator_lookback_and_no_fixed_end(
         self,
     ) -> None:
@@ -304,15 +331,20 @@ class MarketSummaryTests(unittest.TestCase):
             index=pd.to_datetime(["2026-08-07"]),
         )
 
+        app.download_stock_data.clear()
         with patch.object(
-            app.yf, "download", return_value=market_data
+            app.MARKET_DATA_SOURCE,
+            "history",
+            return_value=market_data,
         ) as download:
             returned_data = app.download_stock_data("AAPL", "2026-01-01")
 
         self.assertIs(returned_data, market_data)
-        self.assertEqual(download.call_args.kwargs["start"], "2024-11-27")
+        self.assertEqual(
+            download.call_args.kwargs["start_date"],
+            "2024-11-27",
+        )
         self.assertNotIn("period", download.call_args.kwargs)
-        self.assertNotIn("end", download.call_args.kwargs)
 
     def test_visible_data_starts_on_selected_date(self) -> None:
         market_data = pd.DataFrame(
@@ -448,7 +480,10 @@ class MarketSummaryTests(unittest.TestCase):
             def get_calendar(self):
                 return {"Ex-Dividend Date": pd.Timestamp("2026-08-10")}
 
-        with patch.object(app.yf, "Ticker", return_value=FallbackTicker()):
+        yahoo = MagicMock()
+        yahoo.Ticker.return_value = FallbackTicker()
+        source = YahooFinanceDataSource(yahoo)
+        with patch.object(app, "MARKET_DATA_SOURCE", source):
             metrics = app.get_fundamental_metrics("FALLBACK")
 
         self.assertEqual(
@@ -490,11 +525,10 @@ class MarketSummaryTests(unittest.TestCase):
             def get_calendar(self):
                 return {"Ex-Dividend Date": pd.Timestamp("2026-08-21")}
 
-        with patch.object(
-            app.yf,
-            "Ticker",
-            return_value=QuarterlyDividendTicker(),
-        ):
+        yahoo = MagicMock()
+        yahoo.Ticker.return_value = QuarterlyDividendTicker()
+        source = YahooFinanceDataSource(yahoo)
+        with patch.object(app, "MARKET_DATA_SOURCE", source):
             metrics = app.get_fundamental_metrics("WMT-FALLBACK")
 
         self.assertIn(("Dividend", "$0.99"), metrics)
@@ -531,11 +565,10 @@ class MarketSummaryTests(unittest.TestCase):
                     "exDividendDate": 1_787_270_400,
                 }
 
-        with patch.object(
-            app.yf,
-            "Ticker",
-            side_effect=[UnavailableTicker(), RecoveredTicker()],
-        ):
+        yahoo = MagicMock()
+        yahoo.Ticker.side_effect = [UnavailableTicker(), RecoveredTicker()]
+        source = YahooFinanceDataSource(yahoo)
+        with patch.object(app, "MARKET_DATA_SOURCE", source):
             metrics = app.get_fundamental_metrics("WMT-RETRY")
 
         self.assertEqual(

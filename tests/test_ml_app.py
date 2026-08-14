@@ -31,17 +31,17 @@ class PredictionDataTests(unittest.TestCase):
         self,
     ) -> None:
         history = sample_history()
-        with patch.object(ml_ui.yf, "download", return_value=history) as download:
+        with patch.object(
+            ml_ui.MARKET_DATA_SOURCE,
+            "history",
+            return_value=history,
+        ) as download:
             result = ml_ui.download_prediction_history("MSFT", "2020-12-01")
 
         self.assertEqual(len(result), len(history))
         download.assert_called_once_with(
             "MSFT",
-            start="2020-12-01",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-            multi_level_index=False,
+            start_date="2020-12-01",
         )
 
     def test_prediction_history_rejects_missing_required_columns(self) -> None:
@@ -50,8 +50,8 @@ class PredictionDataTests(unittest.TestCase):
             index=pd.to_datetime(["2026-08-12"]),
         )
         with patch.object(
-            ml_ui.yf,
-            "download",
+            ml_ui.MARKET_DATA_SOURCE,
+            "history",
             return_value=incomplete_history,
         ):
             with self.assertRaisesRegex(ValueError, "required price data"):

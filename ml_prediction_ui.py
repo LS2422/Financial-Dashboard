@@ -1,32 +1,29 @@
 from __future__ import annotations
 
 import math
-import re
-from collections.abc import Mapping
+import logging
 from datetime import date
 
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 
+from app_logging import get_logger, log_event
+from market_data import MarketDataSource, YAHOO_MARKET_DATA_SOURCE
 import ml_prediction
 
 
 PREDICTION_CACHE_SECONDS = 3600
 EQUITY_QUOTE_TYPE = "EQUITY"
-TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
+MARKET_DATA_SOURCE: MarketDataSource = YAHOO_MARKET_DATA_SOURCE
+LOGGER = get_logger(__name__)
 
 
 @st.cache_data(ttl=PREDICTION_CACHE_SECONDS, show_spinner=False)
 def download_prediction_history(ticker: str, start_date: str) -> pd.DataFrame:
     """Download the independent history required by the ML artifact."""
-    data = yf.download(
+    data = MARKET_DATA_SOURCE.history(
         ticker,
-        start=start_date,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        multi_level_index=False,
+        start_date=start_date,
     )
     missing_columns = [
         column
@@ -54,42 +51,7 @@ def is_equity_quote_type(quote_type: str | None) -> bool:
 @st.cache_data(ttl=PREDICTION_CACHE_SECONDS, show_spinner=False)
 def get_instrument_quote_type(ticker: str) -> str:
     """Return Yahoo's quote type using search metadata with an info fallback."""
-    normalized_ticker = ticker.strip().upper()
-    if not TICKER_PATTERN.fullmatch(normalized_ticker):
-        raise ValueError("Enter a valid ticker symbol.")
-    quote_type = None
-
-    try:
-        search_results = yf.Search(
-            normalized_ticker,
-            max_results=8,
-            news_count=0,
-            lists_count=0,
-        ).quotes
-        exact_match = next(
-            (
-                result
-                for result in search_results
-                if result.get("symbol", "").upper() == normalized_ticker
-            ),
-            None,
-        )
-        if exact_match:
-            quote_type = exact_match.get("quoteType")
-    except Exception:
-        pass
-
-    if not quote_type:
-        try:
-            market_info = yf.Ticker(normalized_ticker).get_info()
-            if isinstance(market_info, Mapping):
-                quote_type = market_info.get("quoteType")
-        except Exception:
-            pass
-
-    if not isinstance(quote_type, str) or not quote_type.strip():
-        raise ValueError("Yahoo Finance returned no instrument type.")
-    return quote_type.strip().upper()
+    return MARKET_DATA_SOURCE.quote_type(ticker)
 
 
 def _render_prediction_metrics(
@@ -176,7 +138,15 @@ def render_ml_prediction(ticker: str, *, today: date | None = None) -> None:
 
     try:
         quote_type = get_instrument_quote_type(ticker)
-    except Exception:
+    except Exception as error:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "ml_quote_type_unavailable",
+            ticker=ticker,
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         st.warning(
             "The forecast was not run because Yahoo Finance could not "
             "confirm that this symbol is a stock."
@@ -206,9 +176,25 @@ def render_ml_prediction(ticker: str, *, today: date | None = None) -> None:
             bundle.metadata,
         )
     except (FileNotFoundError, ImportError, ValueError) as error:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "ml_forecast_unavailable",
+            ticker=ticker,
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         st.warning(f"The ML forecast is currently unavailable: {error}")
         return
-    except Exception:
+    except Exception as error:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "ml_forecast_failed",
+            ticker=ticker,
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         st.warning(
             "The ML forecast could not be produced from the latest Yahoo "
             "Finance data. Please try again later."

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-import re
+import logging
 import sqlite3
 from collections.abc import Mapping
 from datetime import date, timedelta
@@ -12,17 +12,26 @@ from urllib.parse import urlencode, urlparse
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yfinance as yf
 
+import market_data as market_data_module
+from app_logging import get_logger, log_event, start_request
+from market_data import (
+    MarketDataSource,
+    YAHOO_MARKET_DATA_SOURCE,
+    clean_ticker,
+    validate_ticker,
+)
 from ml_prediction_ui import render_ml_prediction
 
 
 WATCHLIST_DB_PATH = Path(__file__).with_name(".watchlist.db")
-TICKER_PATTERN = re.compile(r"^[A-Z0-9^][A-Z0-9^.=-]{0,19}$")
 INDICATOR_LOOKBACK_DAYS = 400
 FUNDAMENTALS_CACHE_SECONDS = 900
-YAHOO_NETWORK_RETRIES = 2
-yf.config.network.retries = YAHOO_NETWORK_RETRIES
+MARKET_DATA_SOURCE: MarketDataSource = YAHOO_MARKET_DATA_SOURCE
+LOGGER = get_logger(__name__)
+estimate_forward_dividend_rate = (
+    market_data_module.estimate_forward_dividend_rate
+)
 MOMENTUM_COLOURS = {
     "positive": "#22c55e",
     "negative": "#ef6461",
@@ -137,19 +146,6 @@ COMMON_MARKETS = {
 }
 
 
-def clean_ticker(ticker: str) -> str:
-    """Remove extra spaces and use the uppercase ticker format."""
-    return ticker.strip().upper()
-
-
-def validate_ticker(ticker: str) -> str:
-    """Return a normalized ticker or raise when its format is unsafe."""
-    cleaned_ticker = clean_ticker(ticker)
-    if not TICKER_PATTERN.fullmatch(cleaned_ticker):
-        raise ValueError("Enter a valid ticker symbol.")
-    return cleaned_ticker
-
-
 def selected_ticker_from_query(query_params: Mapping[str, object]) -> str:
     """Return one validated ticker selected through the page URL."""
     selected_ticker = query_params.get("ticker", "")
@@ -262,13 +258,9 @@ def indicator_calculation_start(start_date: str) -> str:
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_stock_data(ticker: str, start_date: str) -> pd.DataFrame:
     """Download through Yahoo's newest row with extra indicator history."""
-    data = yf.download(
+    data = MARKET_DATA_SOURCE.history(
         ticker,
-        start=indicator_calculation_start(start_date),
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        multi_level_index=False,
+        start_date=indicator_calculation_start(start_date),
     )
 
     # Raising prevents Streamlit from caching a temporary empty Yahoo response.
@@ -509,133 +501,9 @@ def format_fundamental_metrics(
     return metrics
 
 
-def estimate_forward_dividend_rate(dividends: pd.Series) -> float | None:
-    """Estimate an annual rate from the latest recurring dividend payment."""
-    if not isinstance(dividends, pd.Series) or dividends.empty:
-        return None
-
-    available_dividends = pd.to_numeric(
-        dividends,
-        errors="coerce",
-    ).dropna()
-    available_dividends = available_dividends[available_dividends > 0]
-    if available_dividends.empty:
-        return None
-
-    payment_frequency = None
-    valid_dates = pd.Series(dtype="datetime64[ns, UTC]")
-    if isinstance(available_dividends.index, pd.DatetimeIndex):
-        payment_dates = pd.to_datetime(
-            available_dividends.index,
-            errors="coerce",
-            utc=True,
-        )
-        valid_dates = pd.Series(payment_dates).dropna().sort_values()
-    if len(valid_dates) >= 2:
-        payment_gaps = valid_dates.diff().dt.days.dropna()
-        if not payment_gaps.empty:
-            median_gap = float(payment_gaps.tail(12).median())
-            if median_gap <= 45:
-                payment_frequency = 12
-            elif median_gap <= 150:
-                payment_frequency = 4
-            elif median_gap <= 250:
-                payment_frequency = 2
-            else:
-                payment_frequency = 1
-
-    if payment_frequency is None:
-        return float(available_dividends.tail(4).sum())
-    return float(available_dividends.iloc[-1]) * payment_frequency
-
-
 def collect_fundamental_info(ticker: str) -> dict[str, object]:
     """Collect fundamentals with independent fallbacks for Yahoo outages."""
-    instrument = yf.Ticker(ticker)
-    market_info: dict[str, object] = {}
-    detailed_info_loaded = False
-
-    try:
-        detailed_info = instrument.get_info()
-        if isinstance(detailed_info, Mapping):
-            market_info.update(detailed_info)
-            detailed_info_loaded = bool(detailed_info)
-    except Exception:
-        pass
-
-    if not detailed_info_loaded:
-        try:
-            instrument = yf.Ticker(ticker)
-            detailed_info = instrument.get_info()
-            if isinstance(detailed_info, Mapping):
-                market_info.update(detailed_info)
-        except Exception:
-            pass
-
-    def numeric_value_missing(key: str) -> bool:
-        return _available_number(market_info.get(key)) is None
-
-    fast_info: dict[str, object] = {}
-    if any(
-        numeric_value_missing(key)
-        for key in ("trailingPE", "marketCap", "sharesOutstanding")
-    ):
-        try:
-            fast_info.update(dict(instrument.get_fast_info()))
-        except Exception:
-            pass
-
-    if numeric_value_missing("marketCap"):
-        market_info["marketCap"] = fast_info.get("marketCap")
-    if numeric_value_missing("sharesOutstanding"):
-        market_info["sharesOutstanding"] = fast_info.get("shares")
-
-    if numeric_value_missing("trailingEps"):
-        try:
-            income_statement = instrument.get_income_stmt(freq="trailing")
-            if isinstance(income_statement, pd.DataFrame):
-                for row_name in ("DilutedEPS", "BasicEPS"):
-                    if row_name not in income_statement.index:
-                        continue
-                    available_eps = pd.to_numeric(
-                        income_statement.loc[row_name],
-                        errors="coerce",
-                    ).dropna()
-                    if not available_eps.empty:
-                        market_info["trailingEps"] = float(
-                            available_eps.iloc[0]
-                        )
-                        break
-        except Exception:
-            pass
-
-    if numeric_value_missing("trailingPE"):
-        latest_price = _available_number(fast_info.get("lastPrice"))
-        trailing_eps = _available_number(market_info.get("trailingEps"))
-        if latest_price is not None and trailing_eps not in {None, 0}:
-            market_info["trailingPE"] = latest_price / trailing_eps
-
-    if numeric_value_missing("dividendRate"):
-        try:
-            dividend_rate = estimate_forward_dividend_rate(
-                instrument.get_dividends(period="1y")
-            )
-            if dividend_rate is not None:
-                market_info["dividendRate"] = dividend_rate
-        except Exception:
-            pass
-
-    if not _format_market_date(market_info.get("exDividendDate")):
-        try:
-            calendar = instrument.get_calendar()
-            if isinstance(calendar, Mapping):
-                market_info["exDividendDate"] = calendar.get(
-                    "Ex-Dividend Date"
-                )
-        except Exception:
-            pass
-
-    return market_info
+    return MARKET_DATA_SOURCE.fundamentals(ticker)
 
 
 @st.cache_data(ttl=FUNDAMENTALS_CACHE_SECONDS, show_spinner=False)
@@ -647,13 +515,9 @@ def get_fundamental_metrics(ticker: str) -> list[tuple[str, str]]:
 @st.cache_data(ttl=300, show_spinner=False)
 def download_watchlist_snapshot(ticker: str) -> tuple[float, float]:
     """Return the latest price and one-day change for a watchlist ticker."""
-    data = yf.download(
+    data = MARKET_DATA_SOURCE.history(
         ticker,
         period="5d",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        multi_level_index=False,
     )
     if data.empty or "Close" not in data.columns:
         raise ValueError("Yahoo Finance returned no recent closing prices.")
@@ -663,53 +527,8 @@ def download_watchlist_snapshot(ticker: str) -> tuple[float, float]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_market_details(ticker: str) -> tuple[str, str]:
     """Return a readable market name and exchange for one symbol."""
-    market_name = None
-    exchange_name = None
-
-    try:
-        search_results = yf.Search(
-            ticker,
-            max_results=8,
-            news_count=0,
-            lists_count=0,
-        ).quotes
-
-        exact_match = next(
-            (
-                result
-                for result in search_results
-                if result.get("symbol", "").upper() == ticker
-            ),
-            None,
-        )
-        if exact_match:
-            market_name = exact_match.get("longname") or exact_match.get(
-                "shortname"
-            )
-            exchange_name = exact_match.get("exchDisp") or exact_match.get(
-                "exchange"
-            )
-    except Exception:
-        pass
-
-    if not market_name or not exchange_name:
-        try:
-            market_info = yf.Ticker(ticker).get_info()
-            market_name = market_name or market_info.get(
-                "longName"
-            ) or market_info.get("shortName")
-            exchange_name = exchange_name or market_info.get(
-                "fullExchangeName"
-            ) or market_info.get("exchange")
-        except Exception:
-            pass
-
-    if not market_name:
-        # Exceptions are not cached, so a temporary Yahoo failure can recover
-        # automatically on the next Streamlit rerun.
-        raise ValueError("Yahoo Finance returned no readable market name.")
-
-    return market_name, readable_exchange_name(exchange_name)
+    details = MARKET_DATA_SOURCE.market_details(ticker)
+    return details.name, readable_exchange_name(details.exchange)
 
 
 def fallback_market_details(ticker: str) -> tuple[str, str]:
@@ -1037,7 +856,15 @@ def render_watchlist(
                 current_price, percentage_change = download_watchlist_snapshot(
                     watchlist_ticker
                 )
-            except Exception:
+            except Exception as error:
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "watchlist_snapshot_unavailable",
+                    ticker=watchlist_ticker,
+                    error_type=type(error).__name__,
+                    exc_info=True,
+                )
                 current_price = None
                 percentage_change = None
             snapshots.append(
@@ -1069,7 +896,15 @@ def render_watchlist(
                     st.rerun()
             except ValueError as error:
                 st.warning(str(error))
-            except sqlite3.Error:
+            except sqlite3.Error as error:
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "watchlist_remove_failed",
+                    ticker=ticker_to_remove,
+                    error_type=type(error).__name__,
+                    exc_info=True,
+                )
                 st.warning("The ticker could not be removed locally.")
 
 
@@ -1160,7 +995,15 @@ def render_fundamentals(ticker: str) -> None:
     st.subheader("Company Fundamentals")
     try:
         metrics = get_fundamental_metrics(ticker)
-    except Exception:
+    except Exception as error:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "fundamentals_render_failed",
+            ticker=ticker,
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         metrics = []
     if not metrics:
         st.info(
@@ -1337,18 +1180,8 @@ def build_news_list(news_items: list[dict[str, str]]) -> str:
 @st.cache_data(ttl=900, show_spinner=False)
 def get_latest_news(ticker: str) -> list[dict[str, str]]:
     """Fetch and normalize the newest Yahoo Finance ticker stories."""
-    search_result = yf.Search(
-        ticker,
-        max_results=1,
-        news_count=12,
-        lists_count=0,
-        include_cb=False,
-        include_nav_links=False,
-        include_research=False,
-        include_cultural_assets=False,
-        recommended=0,
-    )
-    return normalize_news_items(search_result.news, ticker, limit=3)
+    raw_news = MARKET_DATA_SOURCE.news(ticker, count=12)
+    return normalize_news_items(raw_news, ticker, limit=3)
 
 
 def render_latest_news(ticker: str) -> None:
@@ -1356,7 +1189,15 @@ def render_latest_news(ticker: str) -> None:
     st.subheader("Latest News")
     try:
         news_items = get_latest_news(ticker)
-    except Exception:
+    except Exception as error:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "news_render_failed",
+            ticker=ticker,
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         news_items = []
     if not news_items:
         st.info("No recent Yahoo Finance news is available for this symbol.")
@@ -1366,6 +1207,13 @@ def render_latest_news(ticker: str) -> None:
 
 def main() -> None:
     """Display the Streamlit dashboard."""
+    request_id = start_request()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "dashboard_render_started",
+        request_id_assigned=request_id,
+    )
     st.set_page_config(page_title="Stock Dashboard", page_icon="📈", layout="wide")
 
     st.markdown(
@@ -1429,7 +1277,14 @@ def main() -> None:
     try:
         watchlist = load_watchlist()
         watchlist_storage_available = True
-    except sqlite3.Error:
+    except sqlite3.Error as error:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "watchlist_load_failed",
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         watchlist = []
         watchlist_storage_available = False
         st.sidebar.warning("The local watchlist storage is unavailable.")
@@ -1449,7 +1304,15 @@ def main() -> None:
                 st.sidebar.info(f"{ticker} is already in your watchlist.")
         except ValueError as error:
             st.sidebar.warning(str(error))
-        except sqlite3.Error:
+        except sqlite3.Error as error:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "watchlist_add_failed",
+                ticker=ticker,
+                error_type=type(error).__name__,
+                exc_info=True,
+            )
             st.sidebar.warning("The ticker could not be saved locally.")
 
     render_watchlist(watchlist, watchlist_storage_available)
@@ -1469,14 +1332,32 @@ def main() -> None:
                 complete_stock_data,
                 start_date.isoformat(),
             )
-    except ValueError:
+    except ValueError as error:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "market_history_unavailable",
+            ticker=ticker,
+            start_date=start_date.isoformat(),
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         st.title("Financial Market Dashboard")
         st.warning(
             f"No recent data was found for {ticker}. Check the symbol, then "
             "try again."
         )
         return
-    except Exception:
+    except Exception as error:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "market_history_failed",
+            ticker=ticker,
+            start_date=start_date.isoformat(),
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         st.title("Financial Market Dashboard")
         st.warning(
             "The data could not be downloaded. Check the symbol and your "
@@ -1494,7 +1375,15 @@ def main() -> None:
 
     try:
         market_name, exchange_name = get_market_details(ticker)
-    except Exception:
+    except Exception as error:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "market_details_fallback_used",
+            ticker=ticker,
+            error_type=type(error).__name__,
+            exc_info=True,
+        )
         market_name, exchange_name = fallback_market_details(ticker)
 
     market_title = (
